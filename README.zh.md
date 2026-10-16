@@ -1,4 +1,4 @@
-<!-- tracks: README.md @ sha256:dfe8174e55384d39 -->
+<!-- tracks: README.md @ sha256:3897d69bae96ab96 -->
 
 # Jumper Gym
 
@@ -8,7 +8,7 @@
 
 ![Gemini Robotics-ER 2 指挥机器人从走近单杠到完成第三个引体向上](docs/media/crabgym-run.gif)
 
-<sub>2026-10-15 的一次运行，从走近单杠到第三个引体向上。左下角是 ER2 调用的工具，右下角是播放倍速，动作之间的空档已剪掉。画面渲染自这次运行的回放：把记录下的调用在仿真器里重新执行一遍，过程与原运行相同。</sub>
+<sub>2026-10-16 的一次运行，从走近单杠到落地：三个引体向上之后，ER2 在没人要求的情况下下了杠。左下角是 ER2 调用的工具，右下角是播放倍速，动作之间的空档已剪掉。画面渲染自运行时记录下的仿真状态。</sub>
 
 本仓库 fork 自 [Jumper](https://github.com/KingKongRobotics/jumper)，即 KingKong Robotics 设计、训练和部署这台机器人的工具集。在此基础上，本仓库加入了螃蟹健身房、为它训练的两个动作，以及机器人控制器为此所需的改动。
 

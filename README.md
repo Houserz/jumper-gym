@@ -9,9 +9,9 @@ hold. Policies trained with reinforcement learning move the legs and the arms.
 
 ![Gemini Robotics-ER 2 directing the robot from the walk in to the third pull-up](docs/media/crabgym-run.gif)
 
-<sub>One run of 2026-10-15, from the walk in to the third pull-up. The label is the call ER2
-made and the corner the speed; the time between actions is cut. Rendered from a replay of
-the run: its recorded calls made again in the simulator, which went the same way.</sub>
+<sub>One run of 2026-10-16, from the walk in to the landing: three pull-ups, then a dismount
+nobody asked for. The label is the call ER2 made and the corner the speed; the time between
+actions is cut. Rendered from the run's own state, recorded as it ran.</sub>
 
 This repository is a fork of [Jumper](https://github.com/KingKongRobotics/jumper), KingKong
 Robotics' toolkit for designing, training and deploying the robot. It adds the gym, two
