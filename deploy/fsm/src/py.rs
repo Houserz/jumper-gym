@@ -106,12 +106,17 @@ pub struct PyFsm {
     state_timeout_us: u64,
     command_timeout_us: u64,
     joints: usize,
-    /// Where the command rests, for every mode at once: what a host that
-    /// builds the command itself starts from and hands over through
-    /// `set_command_axes` -- the bundler, recording a reference -- and where
-    /// whichever mode runs is handed that one command. `play --app` reads the
-    /// person through `operators` instead.
-    rest: Command,
+    /// Where the command rests, mode by mode (`Operators::rest_of`): what a
+    /// host that builds the command itself -- the bundler recording a
+    /// reference, the crab gym's executor -- starts from, for the mode running
+    /// when the tick begins. `play --app` reads the person through `operators`
+    /// instead.
+    rests: HashMap<String, Command>,
+    /// The channels the host named last (`set_command`, `set_command_axes`),
+    /// laid over the running mode's rest every tick: a mode switch moves what
+    /// the host left unnamed to the new mode's rest rather than keeping the
+    /// old one's.
+    asked: Vec<(String, f32)>,
     /// `guide::pad_guide`, as JSON, for `pad_guide()`.
     guide: String,
     /// Each mode's reading of the person, when this host drives the controller
@@ -123,13 +128,30 @@ pub struct PyFsm {
     /// The host's clock as of the latest call that carried one: what a key
     /// reported without a time of its own is stamped with.
     clock_us: u64,
+    /// The state this host asks for by name (`request_mode`), read by the
+    /// cascade's `request:<name>` rules. What an executor sequencing modes
+    /// itself drives the controller with, in place of a pad; forgotten with
+    /// the latches when the command goes stale, so a host that stopped
+    /// talking is not still asking for the mode it last named.
+    request: Option<String>,
 }
 
 impl PyFsm {
     /// Hands off, as a command: zero for a velocity policy, each axis's rest
-    /// for a schema-2 one -- the standing height, not a height of zero.
+    /// for a schema-2 one -- the standing height, not a height of zero -- for
+    /// the mode the controller is in. A state with no policy rests at zero;
+    /// nothing reads its command.
     fn rest(&self) -> Command {
-        self.rest
+        self.rests.get(&self.controller.state().name).copied().unwrap_or_default()
+    }
+
+    /// The running mode's rest with the host's named channels laid over it.
+    fn compose(&self) -> Command {
+        let mut command = self.rest();
+        for (name, value) in &self.asked {
+            command.set_axis(name, *value);
+        }
+        command
     }
 }
 
@@ -225,12 +247,12 @@ impl PyFsm {
         };
         let (state_timeout_us, command_timeout_us) = (cfg.state_timeout_us, cfg.command_timeout_us);
         let latch = Buttons::new(cfg.exclusive);
-        // Each mode's controls, for their rests: this host is handed one
-        // finished command, so it has to rest where every mode reading a
-        // channel rests it. `Operators::shared_rest` refuses two that disagree.
+        // Each mode's controls, for their rests: a command this host is handed
+        // rests what it leaves unnamed where the running mode rests it.
         let every = crate::operator::Operators::of(parsed.iter().map(|(n, c)| (n.as_str(), c)))
             .map_err(err)?;
-        let rest = every.shared_rest().map_err(err)?;
+        let rests: HashMap<String, Command> =
+            parsed.keys().map(|m| (m.clone(), every.rest_of(m))).collect();
         let controller = Controller::new(cfg, setup, parsed, now_us).map_err(err)?;
         // After the controller, whose hooks say which task controls each mode
         // answers.
@@ -244,8 +266,10 @@ impl PyFsm {
             guide,
             operators,
             clock_us: now_us,
-            command: rest,
-            rest,
+            request: None,
+            command: Command::default(),
+            rests,
+            asked: Vec::new(),
             controller,
             latch,
             keys_down: Default::default(),
@@ -310,7 +334,12 @@ impl PyFsm {
     /// scales them (`operators`).
     #[pyo3(signature = (lin_vel_x, lin_vel_y, yaw_rate, now_us = 0))]
     fn set_command(&mut self, lin_vel_x: f32, lin_vel_y: f32, yaw_rate: f32, now_us: u64) {
-        self.command = Command { lin_vel_x, lin_vel_y, yaw_rate, ..self.rest() };
+        self.asked = vec![
+            ("lin_vel_x".into(), lin_vel_x),
+            ("lin_vel_y".into(), lin_vel_y),
+            ("yaw_rate".into(), yaw_rate),
+        ];
+        self.command = self.compose();
         self.last_command_us = Some(now_us);
     }
 
@@ -328,13 +357,70 @@ impl PyFsm {
             return Err(err(format!("{} names and {} values", names.len(), values.len())));
         }
         let mut command = self.rest();
-        for (name, value) in names.iter().zip(values) {
-            if !command.set_axis(name, value) {
+        for (name, value) in names.iter().zip(values.iter()) {
+            if !command.set_axis(name, *value) {
                 return Err(err(format!("'{name}' is not a command channel this controller carries")));
             }
         }
+        self.asked = names.into_iter().zip(values).collect();
         self.command = command;
         self.last_command_us = Some(now_us);
+        Ok(())
+    }
+
+    /// Ask the cascade for a state by name, or for nothing (`None`).
+    ///
+    /// The request stands until it is changed, and is matched by the file's
+    /// `request:<name>` rules below the safety rules: a tilted or blind robot
+    /// is caught first, as it is for a button. A name no `[[fsm.state]]`
+    /// declares is refused here rather than asked for and never answered. The
+    /// request is forgotten with the latches when the command goes stale.
+    ///
+    /// For a host that sequences modes itself -- an executor chaining a walk,
+    /// a scripted mount, pull-ups and a dismount -- and for nothing a person
+    /// drives: a pad reaches a mode through its switches, as on the robot. A
+    /// mode that ends hands over to whatever is requested next, never back
+    /// to the default by itself: that is the executor's to name.
+    #[pyo3(signature = (name, now_us = None))]
+    fn request_mode(&mut self, name: Option<String>, now_us: Option<u64>) -> PyResult<()> {
+        if let Some(n) = name.as_deref() {
+            if self.controller.config().state(n).is_none() {
+                return Err(err(format!(
+                    "'{n}' is not a state this controller's cascade declares; its states are {:?}",
+                    self.controller.config().states.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
+                )));
+            }
+        }
+        self.request = name;
+        // Asking is the host talking: a request also keeps the command fresh,
+        // so an executor that only requests and streams is not read as gone.
+        let now = now_us.unwrap_or(self.clock_us);
+        self.clock_us = self.clock_us.max(now);
+        self.last_command_us = Some(now);
+        Ok(())
+    }
+
+    /// The state the host is asking for, or `None`.
+    #[getter]
+    fn requested(&self) -> Option<String> {
+        self.request.clone()
+    }
+
+    /// Joint targets for a `track_targets` state, **wire order**, rad: one
+    /// per wire joint, exactly as `positions()` comes back. Held by the
+    /// controller until the next call, read only while a tracking state is
+    /// active, moved toward at that state's `rate_limit` and clamped to the
+    /// stops before they reach the servos.
+    ///
+    /// Streaming counts as the host talking, like a command: an executor that
+    /// streams a script and nothing else is not read as gone after
+    /// `command_timeout_ms`.
+    #[pyo3(signature = (targets, now_us = None))]
+    fn set_joint_targets(&mut self, targets: Vec<f32>, now_us: Option<u64>) -> PyResult<()> {
+        self.controller.set_joint_targets(&targets).map_err(err)?;
+        let now = now_us.unwrap_or(self.clock_us);
+        self.clock_us = self.clock_us.max(now);
+        self.last_command_us = Some(now);
         Ok(())
     }
 
@@ -441,7 +527,8 @@ impl PyFsm {
         if !command_fresh {
             self.latch.forget();
             self.keys_down.clear();
-            self.command = self.rest();
+            self.asked.clear();
+            self.request = None;
             if let Some(ops) = self.operators.as_mut() {
                 ops.forget();
             }
@@ -460,6 +547,7 @@ impl PyFsm {
         // moves the joints. Without, the command is the one handed over and no
         // mode's task controls reach anything.
         let controls = crate::types::TaskControls::NONE;
+        self.command = self.compose();
         let input = TickInput {
             state: &self.state,
             command: &self.command,
@@ -467,6 +555,7 @@ impl PyFsm {
             state_fresh,
             command_fresh,
             buttons: self.latch.active(),
+            request: self.request.as_deref(),
             gripper_active: false,
             controls: &controls,
         };

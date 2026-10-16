@@ -554,6 +554,50 @@ def test_a_foot_on_the_packages_platform_counts_as_ground(tmp_path):
     assert touching == 0
 
 
+def test_a_kept_body_stays_its_own_and_still_collides(tmp_path):
+    """A thing the robot holds rather than stands on -- the gym's pull-up bar
+    -- has to keep its own body, or its contacts are the ground's: nothing can
+    say which part of the robot touched the bar, nor how far a claw seats from
+    its axis. `keep_bodies` leaves that body's geometry where `attach` put it,
+    prefixed, colliding, and out of `terrain`.
+
+    The control group is the same world with nothing kept, where the bar's
+    geom is in `terrain` as every static geom is -- so the test cannot pass
+    against an importer that stopped merging. A name that is no body, and the
+    body holding the declared ground, are refused rather than kept for nothing.
+    """
+    bar = WORLD.replace(
+        "<worldbody>",
+        '<worldbody><body name="bar" pos="1.0 0 0.6">'
+        '<geom name="bar_geom" type="capsule" fromto="0 -0.45 0 0 0.45 0" size="0.0125"/></body>',
+    )
+    assert bar != WORLD
+    root = write_package(tmp_path / "bar.scene", files={"scene.xml": bar},
+                         world=_world_with_ground("floor_geom"))
+
+    spec = _host()
+    load_package(root, keep_bodies=("bar",)).decorate(spec)
+    model = spec.compile()
+    terrain = _id(model, mujoco.mjtObj.mjOBJ_BODY, "terrain")
+    geom = _id(model, mujoco.mjtObj.mjOBJ_GEOM, "scn_bar_geom")
+    assert model.geom_bodyid[geom] == _id(model, mujoco.mjtObj.mjOBJ_BODY, "scn_bar")
+    assert model.geom_bodyid[geom] != terrain
+    assert model.geom_contype[geom] != 0 and model.geom_conaffinity[geom] != 0
+    assert model.geom_bodyid[_id(model, mujoco.mjtObj.mjOBJ_GEOM, "scn_wall_geom")] == terrain, \
+        "only the kept body is kept"
+
+    control = _host()
+    load_package(root).decorate(control)
+    merged = control.compile()
+    assert merged.geom_bodyid[_id(merged, mujoco.mjtObj.mjOBJ_GEOM, "scn_bar_geom")] == \
+        _id(merged, mujoco.mjtObj.mjOBJ_BODY, "terrain"), "the control: not kept, merged"
+
+    with pytest.raises(PackageError, match="not a body"):
+        load_package(root, keep_bodies=("bars",))
+    with pytest.raises(PackageError, match="holds the ground"):
+        load_package(root, keep_bodies=("world",))
+
+
 def test_a_mesh_keeps_its_place_when_it_is_rebuilt(tmp_path):
     """MuJoCo recentres a mesh and folds the offset into the geom's compiled
     pose, so a geom rebuilt from that pose gets the offset twice unless it is

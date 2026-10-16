@@ -43,6 +43,7 @@ The viewer's own shortcuts fire beside these (`controller/vocabulary.json`,
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import tempfile
@@ -161,6 +162,27 @@ def leave_falls_to_the_app(env_cfg: Any, app: App) -> list[str]:
             term.params = {**term.params, "limit_angle": tilt + FALL_MARGIN_RAD}
             moved.append(name)
     return moved
+
+
+def disable_fall_reset(env_cfg: Any) -> list[str]:
+    """Take the world's orientation terminations out altogether; returns the
+    ones removed.
+
+    For a world an executor drives rather than a person watches: a robot
+    hanging from a bar is pitched 93 degrees for as long as it hangs, which is
+    past any fall the world could be told to tolerate (`leave_falls_to_the_app`
+    moves the limit 30 degrees past the controller's and no further). With the
+    reset gone a fall is the controller's alone -- `safe`, or the executor's
+    hang-safe state -- and a robot on its side stays there for the executor to
+    report, which is what an evaluation wants to see rather than a teleport
+    back to the stance.
+    """
+    terminations = getattr(env_cfg, "terminations", None) or {}
+    removed = [name for name, term in terminations.items()
+               if (getattr(term, "params", None) or {}).get("limit_angle") is not None]
+    for name in removed:
+        del terminations[name]
+    return removed
 
 
 def step_the_world_at(env_cfg: Any, hz: float) -> None:
@@ -366,9 +388,21 @@ class AppPlayer:
     A policy for `play`'s loop: called once a control step, it runs the
     controller and returns an action of zeros, and the environment's action
     terms, taken over at construction, write the controller's targets instead.
+
+    **Two ways of being driven.** By a person -- the default, `play --app` --
+    through the viewer's keys and a pad, which the controller reads itself
+    through each mode's own controls. Or by an **executor** (`executor=True`):
+    a program that sequences modes and sends the command every tick in the
+    physical units the policies trained on (`command`), asks the cascade for
+    states by name (`request`), streams joint targets for a state that tracks
+    them (`stream`), presses a key the bundle binds (`press`), and steps the
+    world itself (`step`) -- so the world moves only when it is told to, and a
+    planner thinking between two steps costs the robot nothing. The executor
+    path takes no viewer keys and no pad, and renders the world's cameras
+    off-screen for it (`render`). `crabgym` is the executor there is.
     """
 
-    def __init__(self, app: App, env: Any, *, pad: Any = None) -> None:
+    def __init__(self, app: App, env: Any, *, pad: Any = None, executor: bool = False) -> None:
         """A key is handed to the controller stamped with the simulator's time,
         and a held key's stick deflection grows on that clock (`full_after_s`
         in the task's `controls.yaml`). At real time the two agree; at `--speed
@@ -379,7 +413,6 @@ class AppPlayer:
         import torch
 
         from controller import vocabulary
-        from mjrl.viewer import keys
 
         bundle = app.root
         manifest = json.loads((bundle / "bundle.json").read_text("utf-8"))
@@ -405,6 +438,7 @@ class AppPlayer:
         missing = [n for n in wire if n not in sim_names]
         if missing:
             raise AppUnavailable(f"this app drives joints this robot does not have: {missing}")
+        self._wire = list(wire)
         self._wire_from_sim = [sim_names.index(n) for n in wire]
 
         # The clock's period and gate, from a contract that observes one, never
@@ -437,7 +471,9 @@ class AppPlayer:
                     "gait_gate_threshold": gait.get("command_threshold"),
                 },
                 trajectories=trajectories,
-                operators=True,
+                # An executor hands over one finished command in physical units
+                # every tick; a person is read through each mode's controls.
+                operators=not executor,
             )
         except TypeError as error:
             # A controller built before it read the person itself: an app
@@ -447,6 +483,13 @@ class AppPlayer:
                 f"read the keys itself ({error}).\n"
                 "       rebuild the app: python scripts/deploy.py --manifest <name>"
             ) from error
+        self._executor = executor
+        if executor and not all(hasattr(self._fsm, m) for m in ("request_mode", "set_joint_targets")):
+            raise AppUnavailable(
+                f"this app's controller ({origin}) predates the executor path: it takes "
+                "no `request_mode` and streams no joint targets.\n"
+                "       rebuild the app: python scripts/deploy.py --manifest <name>"
+            )
         self._sessions = {
             mode: ort.InferenceSession(
                 str(bundle / entry["models"]["onnx"]), providers=["CPUExecutionProvider"]
@@ -485,16 +528,36 @@ class AppPlayer:
         self._zero = torch.zeros(env.action_space.shape, device=unwrapped.device)
 
         # The person. Keys by the dictionary's names, from the GLFW codes the
-        # viewer reports, down and up.
-        self._viewer_keys = ViewerKeys(
-            {c["glfw"]: name for name, c in vocabulary.key_codes().items()})
-        set_aside = keys.claim(self._on_key)
-        self._keys = keys
-        self._pad = pad
+        # viewer reports, down and up. An executor claims no key and reads no
+        # pad: what it says, it says through `command`, `request`, `stream`
+        # and `press`.
         self._buttons = frozenset(b["name"] for b in vocabulary.load()["buttons"])
         self._tick = 0
         self._step_us = round(unwrapped.step_dt * 1e6)
         self._last_mode = ""
+        set_aside = 0
+        if executor:
+            self._viewer_keys = None
+            self._keys = None
+            self._pad = None
+            #: The command the executor is sending, by channel name, in the
+            #: units the contracts name; handed over every tick, which is also
+            #: what keeps the controller from forgetting the executor.
+            self._axes: dict[str, float] = {}
+            #: Key edges to hand over, one per tick: a `press` is down for one
+            #: tick and up on the next, as a tap through the viewer is.
+            self._edges: list[tuple[str, bool]] = []
+            #: Rendering contexts by `(width, height)`, made on first use.
+            self._renderers: dict[tuple[int, int], Any] = {}
+            self._render_option = None
+        else:
+            from mjrl.viewer import keys
+
+            self._viewer_keys = ViewerKeys(
+                {c["glfw"]: name for name, c in vocabulary.key_codes().items()})
+            set_aside = keys.claim(self._on_key)
+            self._keys = keys
+            self._pad = pad
 
         print(f"[play] playing the app at {bundle}")
         print(f"[play]   controller: {origin}")
@@ -504,9 +567,12 @@ class AppPlayer:
             print(f"[play]   note: {note}")
         print(f"[play]   modes: {', '.join(sorted(self._sessions))}; "
               f"the world is this environment's")
-        print("[play]   the person: the viewer's keys"
-              + (" and the gamepad" if pad is not None else ", no gamepad")
-              + (f" ({set_aside} other key reader(s) set aside)" if set_aside else ""))
+        if executor:
+            print("[play]   the person: nobody; an executor drives the controller")
+        else:
+            print("[play]   the person: the viewer's keys"
+                  + (" and the gamepad" if pad is not None else ", no gamepad")
+                  + (f" ({set_aside} other key reader(s) set aside)" if set_aside else ""))
         # The switches, the pad's and then the keyboard's: two paths since
         # 2026-09-29, a key never "the pad's A", so each is listed as itself.
         guide = json.loads(self._fsm.pad_guide())
@@ -524,10 +590,154 @@ class AppPlayer:
     def fsm(self):
         return self._fsm
 
+    @property
+    def wire(self) -> list[str]:
+        """The bundle's wire joint order."""
+        return list(self._wire)
+
+    @property
+    def wire_from_sim(self) -> list[int]:
+        """The simulator's joint index of each wire joint, in wire order."""
+        return list(self._wire_from_sim)
+
+    @property
+    def now_us(self) -> int:
+        """The simulator's clock as the controller has been told it, microseconds:
+        the number of world steps taken times the step, and nothing else."""
+        return self._tick * self._step_us
+
     def close(self) -> None:
-        self._keys.unregister(self._on_key)
+        if self._keys is not None:
+            self._keys.unregister(self._on_key)
         if self._pad is not None and hasattr(self._pad, "close"):
             self._pad.close()
+        if self._executor:
+            for renderer in self._renderers.values():
+                with contextlib.suppress(Exception):  # EGL's teardown; see mjrl/sensor/camera.py
+                    renderer.close()
+            self._renderers.clear()
+
+    # ── The executor path ────────────────────────────────────────────────
+
+    def _executor_only(self, what: str) -> None:
+        if not self._executor:
+            raise RuntimeError(
+                f"`{what}` is the executor's: this player reads a person through the "
+                "viewer and a pad. Build it with `executor=True`."
+            )
+
+    def command(self, **axes: float) -> None:
+        """What the executor is asking for, by channel -- `lin_vel_x`,
+        `lin_vel_y`, `ang_vel_z`, `twist`, `pitch`, `roll`, `height`, `pull` --
+        in the units the contracts name. Every channel not named is at its
+        rest, and the whole command is handed over again every tick until it
+        is changed: the controller forgets an executor it has not heard from in
+        `command_timeout_ms`, and lets go of what it asked for.
+
+        A name the controller carries no channel for is refused on the next
+        tick, by the controller, rather than dropped here.
+        """
+        self._executor_only("command")
+        self._axes = {name: float(value) for name, value in axes.items()}
+
+    def request(self, mode: str | None) -> None:
+        """Ask the cascade for a state by name, until asked for another or for
+        `None`; the file's `request:<name>` rules answer, below its safety
+        rules. A name the cascade does not declare is refused at once."""
+        self._executor_only("request")
+        self._fsm.request_mode(mode, now_us=self.now_us)
+
+    @property
+    def requested(self) -> str | None:
+        self._executor_only("requested")
+        return self._fsm.requested
+
+    def stream(self, targets: Any) -> None:
+        """Joint targets for a state that tracks them, **wire order**, rad --
+        one per wire joint, as `positions()` comes back. Held until the next
+        call; a tracking state follows them at its own rate limit."""
+        self._executor_only("stream")
+        self._fsm.set_joint_targets([float(v) for v in targets], now_us=self.now_us)
+
+    def press(self, key: str) -> None:
+        """Tap a key the bundle binds -- down for the next tick, up on the one
+        after, as a tap through the viewer is handed on -- for a switch the
+        executor has no request for: a gesture the bundle puts on a key."""
+        self._executor_only("press")
+        self._edges.append((key, True))
+        self._edges.append((key, False))
+
+    def step(self) -> None:
+        """One control step of the world under the controller: the executor's
+        clock. Between two calls nothing moves, however long the caller takes."""
+        self._executor_only("step")
+        import torch
+
+        with torch.inference_mode():
+            self._env.step(self(None))
+
+    def render(self, camera: str, width: int, height: int, *, depth: bool = False):
+        """One frame of the world's camera `camera`, environment 0, as the
+        robot's own camera or a station's would see it: `[height, width, 3]`
+        uint8, or with `depth` `[height, width]` float32 metres along the
+        optical axis, 0 where nothing is in range (`mjrl/sensor/camera.py`'s
+        convention).
+
+        Off-screen, on the live model and data the native backend keeps for
+        each environment; the warp backend brings nothing back to the host and
+        is refused rather than rendered a step stale.
+        """
+        self._executor_only("render")
+        import mujoco
+        import numpy as np
+
+        sim = self._env.unwrapped.sim
+        if not hasattr(sim, "env_mjdata"):
+            raise RuntimeError(
+                "rendering for an executor needs the native backend, whose state is "
+                "already on the host; this world runs on warp"
+            )
+        model, data = sim.env_mjdata(0)
+        cam = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera)
+        if cam < 0:
+            names = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_CAMERA, i) for i in range(model.ncam)]
+            raise ValueError(f"the world has no camera {camera!r}; it has {names}")
+        key = (width, height)
+        renderer = self._renderers.get(key)
+        if renderer is None:
+            from mjrl.sensor.camera import _no_multisampling, scene_option
+
+            with _no_multisampling(model):
+                renderer = mujoco.Renderer(model, height=height, width=width)
+            self._renderers[key] = renderer
+            if self._render_option is None:
+                # Geoms only: no sites, joints or contact arrows in what a
+                # planner is shown.
+                self._render_option = scene_option(range(3))
+        if depth:
+            renderer.enable_depth_rendering()
+        else:
+            renderer.disable_depth_rendering()
+        renderer.update_scene(data, camera=cam, scene_option=self._render_option)
+        frame = renderer.render()
+        if depth:
+            zfar = np.float32(model.vis.map.zfar * model.stat.extent)
+            frame = np.where(frame >= zfar, np.float32(0.0), frame).astype(np.float32)
+        return frame
+
+    def camera_pose(self, camera: str) -> tuple[Any, Any]:
+        """Where the world's camera `camera` is, environment 0: `(position,
+        rotation)` world frame, the rotation a 3x3 whose columns are the
+        camera's axes -- MuJoCo's, looking down -z with +y up."""
+        self._executor_only("camera_pose")
+        import mujoco
+        import numpy as np
+
+        model, data = self._env.unwrapped.sim.env_mjdata(0)
+        cam = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera)
+        if cam < 0:
+            raise ValueError(f"the world has no camera {camera!r}")
+        return np.array(data.cam_xpos[cam]), np.array(data.cam_xmat[cam]).reshape(3, 3)
 
     def _apply(self) -> None:
         self._robot.set_joint_position_target(self._targets)
@@ -541,7 +751,15 @@ class AppPlayer:
         self._viewer_keys.report(keycode, down)
 
     def _person(self, now_us: int) -> None:
-        """Keys down and up since the last step, and a frame of the pad."""
+        """Keys down and up since the last step, and a frame of the pad -- or,
+        for an executor, its command and one key edge."""
+        if self._executor:
+            if self._edges:
+                key, down = self._edges.pop(0)
+                self._fsm.set_key(key, down, now_us)
+            names = list(self._axes)
+            self._fsm.set_command_axes(names, [self._axes[n] for n in names], now_us)
+            return
         downs, ups = self._viewer_keys.changes()
         for name in downs:
             self._fsm.set_key(name, True, now_us)

@@ -28,6 +28,8 @@ MARKER = re.compile(
     r"(?P<digest>[0-9a-f]{16})(?P<tail>\s*-->)"
 )
 ROOTS = ("", "docs", "deploy", "notebooks")
+#: Searched all the way down, as `tests/test_translations.py` searches it.
+TASKS = "tasks"
 
 
 def digest_of(path: Path) -> str:
@@ -54,6 +56,7 @@ def main() -> int:
     args = ap.parse_args()
 
     found = [p for root in ROOTS for p in sorted((REPO / root).glob("*.zh.md"))]
+    found += sorted((REPO / TASKS).rglob("*.zh.md"))
     if not found:
         print("[stamp] no *.zh.md anywhere in", ROOTS)
         return 1

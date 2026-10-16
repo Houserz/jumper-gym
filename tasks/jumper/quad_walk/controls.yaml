@@ -1,0 +1,183 @@
+# jumper.quad_walk operator controls -- how a person's input becomes the two
+# commands the policy observes.
+#
+# Started from `.claude/skills/controls/scripts/write_controls.py`, which takes
+# every control name from `controller/vocabulary.json` and writes one command;
+# the second command, the split stick, the R3 layer and the keyboard's posture
+# keys are hand edits in `tasks/jumper/posture/controls.yaml`'s shape. Every
+# control name is still checked against the dictionary on load, so a typo stops
+# `play` rather than binding nothing.
+#
+# ## The layout is jumper.posture's, on purpose
+#
+# Asked for on 2026-10-08: "手柄和键盘映射沿用 posture 的布局：左摇杆走；右摇杆管抬头
+# 和转向；按住 R3 再推右摇杆调高度". The two tasks also share the command format --
+# the walk and the four posture channels -- so a mode switch from one to the
+# other keeps what every stick and key means. What differs is the range behind
+# two of the channels:
+#
+#     does                          pad                             keyboard
+#     walk forward / back           left stick up / down            W S, or the arrows
+#     walk left / right             left stick left / right         A D, or the arrows
+#     pitch: nose up                right stick pulled back         K
+#     turn: ccw / clockwise         right stick l / r, second half  J L
+#     height up / down              R3 held, right stick up / down  N M, held
+#       -- on the pad a speed, and let go it stays where it is; on the keys
+#          the high and the low stance, and let go it is the neutral one again
+#     height back to neutral        R3 tapped                       (let N or M go)
+#     let go of everything          B                               Esc
+#     (hands off)                   stand still, level, at the height last set
+#
+# **Twist and roll are fixed at zero in this task** (`env_cfg.py`, the posture
+# command's ranges), and so is nose-down pitch. Their pad bindings are posture's
+# and command exactly zero here: `load_controls` needs every command axis on the
+# pad, and keeping them where posture has them is what keeps the right stick's
+# turn where it is in posture -- past half travel. The keyboard leaves twist and
+# roll unbound and says so.
+#
+# Two rules this file inherits from the specification it replaced:
+#   * Every value carries its source. A number without one cannot be told
+#     apart from a guess.
+#   * A consumer fails on a missing or malformed value rather than
+#     substituting a default. A sign that defaults to +1 is a robot that walks
+#     backwards while the screen looks perfectly normal.
+
+schema_version: 2
+
+command:
+  - term: twist
+    # The observation term these numbers are written into.
+    feeds: velocity_commands
+    # The robot's own frame: +X forward, +Y left, +Z up (ROS REP-103).
+    frame: body
+    # Order is the order the command term writes them, and therefore the order
+    # they appear in the observation.
+    axes:
+      - name: lin_vel_x
+        unit: m/s
+        positive: forward
+      - name: lin_vel_y
+        unit: m/s
+        positive: left
+      - name: ang_vel_z
+        unit: rad/s
+        positive: counter-clockwise
+    scaling:
+      # Full deflection is the edge of the range the policy was **trained** on,
+      # not an absolute speed -- so a stick means "as fast as this policy was
+      # ever asked to go" and cannot ask for something off-distribution.
+      rule: full_deflection_is_range_edge
+      formula: axis * (range_max if axis >= 0 else -range_min)
+      # A range like (-0.5, 1.0) gives forward twice what it gives back, which is
+      # what the policy trained on; taking the larger end for both quietly
+      # commands something it never saw.
+      ends_scaled_separately: true
+
+  - term: posture
+    feeds: posture_command
+    # Each channel against its own reference, as `mdp/state.py` measures it: the
+    # four walking feet, since the arms are off the ground in this task.
+    frame: twist over the walking feet; pitch and roll against gravity; height above the walking feet
+    axes:
+      - name: twist
+        unit: rad
+        positive: counter-clockwise
+      - name: pitch
+        unit: rad
+        # Nose down, jumper.posture's and jumper.five_foot's convention, so this
+        # task's nose-up range is negative: (-30 deg, 0).
+        positive: nose down
+      - name: roll
+        unit: rad
+        positive: left side up
+      - name: height
+        unit: m
+        positive: up
+        # Where the height starts and where letting go of everything puts it
+        # back: the four-foot stance's own height, not zero -- zero is a body on
+        # the floor. Named rather than written, so it cannot drift from the
+        # command's own `neutral_height`.
+        rest: neutral_height
+        # Moved rather than placed on the pad, as jumper.posture's: a deflection
+        # is a speed, full deflection carries it from the neutral height to
+        # either end of its range in this many seconds, and let go it stays.
+        # posture's one second, for the same layout; not measured here.
+        integrate_s: 1.0
+    scaling:
+      # The same rule, measured from `rest` rather than from zero; an axis that
+      # names no `rest` rests at zero. A range with one end at its rest -- the
+      # pitch, (-30 deg, 0) -- gives nothing on that end's side of the stick.
+      rule: full_deflection_is_range_edge
+      formula: rest + axis * (range_max - rest if axis >= 0 else rest - range_min)
+      ends_scaled_separately: true
+
+devices:
+  gamepad:
+    # The stick position *is* the command, on every channel but the height,
+    # which it moves (`integrate_s` above).
+    scheme: absolute
+    layout: xbox
+    axes:
+      # Walking, as every locomotion task has it and with the same two evdev
+      # negations: Ly is positive **down**, Lx positive **right**.
+      lin_vel_x: { source: Ly, sign: -1 }
+      lin_vel_y: { source: Lx, sign: -1 }
+      # jumper.posture's split of the right stick's left-right travel: the first
+      # half twists, the second half turns. The twist commands zero here (its
+      # range is (0, 0)), so the turn starts past half travel, as in posture.
+      # Right is clockwise, which is negative for both.
+      twist:     { source: Rx, sign: -1, travel: [0.0, 0.5, 0.5, 0.75] }
+      ang_vel_z: { source: Rx, sign: -1, travel: [0.5, 1.0] }
+      # Ry is positive towards the operator: pulled back is nose up, and nose up
+      # is negative pitch, so -1, posture's sign. Pushed forward asks for nose
+      # down, which this task's range clamps to zero.
+      pitch:     { source: Ry, sign: -1 }
+      # posture's roll on the R3 layer; fixed at zero here.
+      roll:      { source: Rx, sign: 1, shifted: true }
+      # With R3 held the up-down travel is the height instead, and pitch is zero
+      # while it is: up is taller, so -1 as for pitch. A speed: let go of the
+      # stick, or of R3, and the height stays where it is.
+      height:    { source: Ry, sign: -1, shifted: true }
+    # R3 is held, not toggled, as in posture: the height layer is in while the
+    # stick is pressed down and out the moment it comes up.
+    shift: { button: R3, gesture: hold }
+    # A tap of R3 -- pressed and let go without the right stick moving -- puts
+    # the height back at neutral, as in posture.
+    reset: R3
+    # The pad service applies a 0.15 deadband and **rescales**, so full
+    # deflection still reaches ±1. A consumer that applies its own on top narrows
+    # the range a person can ask for and cannot tell that it has.
+    deadzone: device_reported_rescaled
+    # Hands both commands back to the random sampler in `play --task`; on a
+    # robot, which has no sampler, it lets go of everything, the height included.
+    release_button: B
+
+  keyboard:
+    # Keystrokes bound to what they do: each pushes one direction of one axis,
+    # "+" being the axis's own positive direction as `positive:` above words it,
+    # so the keyboard has no signs of its own -- there is no stick for a sign to
+    # be relative to.
+    scheme: keys
+    # Seconds a key is held for full deflection: the axis climbs linearly until
+    # then and is back at rest the moment the key comes up -- the height
+    # included: the keys place it where the stick moves it. posture's value.
+    full_after_s: 2.0
+    axes:
+      # W S and the arrows walk, A D and the arrows step sideways, J L turn: the
+      # layout every jumper task shares. Every letter is also a MuJoCo viewer
+      # shortcut (`tasks/jumper/posture/mdp/teleop.py` has the table).
+      lin_vel_x: { "+": [key_w, key_up], "-": [key_s, key_down] }
+      lin_vel_y: { "+": [key_a, key_left], "-": [key_d, key_right] }
+      ang_vel_z: { "+": [key_j], "-": [key_l] }
+      # posture's H ; and U O are left free: the twist and the roll are fixed
+      # at zero in this task, and a key bound to them would do nothing.
+      twist:     { unbound: "fixed at zero in jumper.quad_walk (posture's H and ; twist)" }
+      roll:      { unbound: "fixed at zero in jumper.quad_walk (posture's U and O roll)" }
+      # I K as in posture: K tips the nose up. I asks for nose down, which this
+      # task's range clamps to zero.
+      pitch:     { "+": [key_i], "-": [key_k] }
+      # N M hold the body high and low, stances as in posture: held, the body
+      # goes there, and let go it is back at the neutral height.
+      height:    { "+": [key_n], "-": [key_m] }
+    # Lets go of everything, as the pad's B does.
+    release: [key_escape]

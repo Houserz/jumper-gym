@@ -26,8 +26,9 @@ use crate::types::{MotorCommand, RobotState};
 
 #[derive(Debug, Clone)]
 pub struct ActionConfig {
-    /// From the layout's `action_scale`.
-    pub scale: f32,
+    /// From the layout's `action_scale`, one per action element: a number
+    /// there is the same scale on every joint, a map is each joint's own.
+    pub scale: Vec<f32>,
     /// Symmetric clamp on the raw network output, before scaling.
     pub clip: f32,
     /// Per-decode EMA on the target. 0 disables. Distinct from the output-stage
@@ -57,6 +58,15 @@ pub struct ActionDecoder {
 
 impl ActionDecoder {
     pub fn new(act: ActionConfig, lim: RobotLimits) -> Self {
+        // Both come from one contract (`Contract::action_scale` and
+        // `action_wire_idx`), so a mismatch is this crate's own error and not
+        // a bundle's; a scale silently read as zero would hold a joint still
+        // under a policy driving it.
+        assert_eq!(
+            act.scale.len(),
+            act.action_wire_idx.len(),
+            "one action scale per action element"
+        );
         let joints = lim.default_wire.len();
         Self { act, lim, joints }
     }
@@ -107,7 +117,7 @@ impl ActionDecoder {
             let base = baseline
                 .and_then(|b| b.get(w).copied())
                 .unwrap_or(self.lim.default_wire[w]);
-            let mut t = base + self.act.scale * a;
+            let mut t = base + self.act.scale[i] * a;
 
             if self.act.smoothing > 0.0 {
                 t = self.act.smoothing * prev_target[w] + (1.0 - self.act.smoothing) * t;
@@ -241,7 +251,7 @@ mod tests {
     fn decoder(joints: usize, action_wire: Vec<usize>) -> ActionDecoder {
         ActionDecoder::new(
             ActionConfig {
-                scale: 0.25,
+                scale: vec![0.25; action_wire.len()],
                 clip: 100.0,
                 smoothing: 0.0,
                 effort_limit: 2.0,

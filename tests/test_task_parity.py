@@ -93,6 +93,16 @@ NOT_LOCOMOTION = {
     # listing them as exemptions would empty the parity test rather than
     # describe it.
     "jumper.posture",
+    # Hangs from a bar by both claws and tracks a commanded height: no twist, no
+    # foot touches anything, and the terms the four measure against gravity are
+    # the ones it had to remove. It builds a prop of its own as well. Nothing it
+    # could agree with the four on would mean the same thing.
+    "jumper.pull_up",
+    # Stands and walks on four legs with both arms raised and moved by the
+    # environment: twelve driven joints and four feet against twenty and six,
+    # posture's second command, and a reward set of its own. Beside the four it
+    # would be measuring a leg count, not a gait.
+    "jumper.quad_walk",
 }
 
 #: Fields a task is allowed to differ on because **the gait fixes them**.

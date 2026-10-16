@@ -42,6 +42,9 @@ pub struct Inputs {
     /// bindings are independent: `LB` held while `A` is pressed is two things
     /// at once, and which one wins is the cascade's order.
     pub buttons: std::collections::BTreeSet<String>,
+    /// The state the host asks for by name, matched by `request:<name>`
+    /// rules. `None` from every host but `play`'s extension.
+    pub request: Option<String>,
     pub gripper_active: bool,
     /// Every joint within `pose_reach_tol` of the active warm start's target.
     pub pose_reached: bool,
@@ -148,6 +151,7 @@ impl Fsm {
                 When::Tilted => armed && inputs.tilt.is_some_and(|t| t > self.cfg.tilt_limit),
                 When::InState(name) => &self.current == name,
                 When::Button(name) => inputs.buttons.contains(name.as_str()),
+                When::Request(name) => inputs.request.as_deref() == Some(name.as_str()),
                 When::GripperActive => inputs.gripper_active,
                 When::WarmStartReached => {
                     let s = self.current();
@@ -191,6 +195,7 @@ mod tests {
             command_fresh: true,
             tilt: Some(0.0),
             buttons: Default::default(),
+            request: None,
             gripper_active: false,
             pose_reached: false,
         }
@@ -325,6 +330,36 @@ mod tests {
             "with the tilt rule demoted below the button, a tilted robot jumps -- \
              which is why the order is in the file and not in a docstring"
         );
+    }
+
+    /// A host's request enters its state as a button does, and only below the
+    /// safety rules: a request made while tilted lands in `safe`, and a
+    /// request for nothing is the `always` rule. The control is the same
+    /// inputs with no request, which never leave locomotion.
+    #[test]
+    fn a_request_is_a_button_the_host_presses_by_name() {
+        let cascade = EXAMPLE.replacen(
+            "[[fsm.rule]]\nwhen = \"button:jump\"",
+            "[[fsm.rule]]\nwhen = \"request:jump\"\nenter = \"jump\"\n\n[[fsm.rule]]\nwhen = \"button:jump\"",
+            1,
+        );
+        assert_ne!(cascade, EXAMPLE);
+        let mut f = Fsm::new(FsmConfig::parse(&cascade).unwrap(), 0);
+        f.current = "locomotion".into();
+        f.update(&Inputs { request: Some("jump".into()), ..healthy() }, 10);
+        assert_eq!(f.current().name, "jump");
+        f.update(&Inputs { request: None, ..healthy() }, 20);
+        assert_eq!(f.current().name, "locomotion", "a request withdrawn is the default again");
+
+        let mut f = Fsm::new(FsmConfig::parse(&cascade).unwrap(), 0);
+        f.current = "locomotion".into();
+        f.update(&Inputs { tilt: Some(1.2), request: Some("jump".into()), ..healthy() }, 10);
+        assert_eq!(f.current().name, "safe", "a request cannot launch a tilted robot");
+
+        let mut f = Fsm::new(FsmConfig::parse(&cascade).unwrap(), 0);
+        f.current = "locomotion".into();
+        f.update(&healthy(), 10);
+        assert_eq!(f.current().name, "locomotion", "the control: nothing asked, nothing entered");
     }
 
     /// An invalid attitude is not a level one. The host passes `None`, and the

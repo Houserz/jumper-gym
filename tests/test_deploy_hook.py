@@ -121,6 +121,86 @@ def test_a_modes_hook_reaches_its_state_and_the_record(tmp_path) -> None:
         deploy.compose_fsm(null, detail, {m: f"{m}.onnx" for m in modes}, manifest)
 
 
+def test_a_mode_s_tilt_exemption_reaches_its_state(tmp_path) -> None:
+    """A mode that hangs from a bar is 93 degrees of pitch, past every cascade's
+    `tilt_limit`; its manifest entry says `skip_tilt_check`, and the flag has to
+    land on the composed `[[fsm.state]]` or the cascade drops the hanging robot
+    to `safe` -- damping only, which is a fall -- the moment the policy starts.
+    Read back as TOML. The control group is the mode that says nothing, whose
+    state carries no flag; and a value that is not a bool is refused rather than
+    written as something.
+    """
+    import copy
+
+    import tomllib
+
+    deploy = _deploy_module()
+    export = tmp_path / "export"
+    export.mkdir()
+    (export / "layout.json").write_text("{}", "utf-8")
+    (tmp_path / "cascade.toml").write_text(CASCADE, "utf-8")
+    manifest = tmp_path / "manifests.json"
+    spec = {"fsm": "cascade.toml", "modes": {
+        "walk": {"task": "jumper.tripod", "policy": str(export), "keys": {"key": ["keypad_1"]}},
+        "slow": {"task": "jumper.pull_up", "policy": str(export), "pad": {"button": "A"},
+                 "skip_tilt_check": True},
+    }}
+    modes, detail = deploy.manifest_modes(spec, manifest)
+    assert detail["slow"]["skip_tilt_check"] is True, "bundle.json's built_from would not record it"
+    assert "skip_tilt_check" not in detail["walk"]
+    states = {s["name"]: s for s in tomllib.loads(
+        deploy.compose_fsm(spec, detail, {m: f"{m}.onnx" for m in modes}, manifest))["fsm"]["state"]}
+    assert states["slow"]["skip_tilt_check"] is True
+    assert "skip_tilt_check" not in states["walk"]
+
+    for bad in ("yes", 1, None):
+        broken = copy.deepcopy(spec)
+        broken["modes"]["slow"]["skip_tilt_check"] = bad
+        with pytest.raises(SystemExit, match="true or false"):
+            deploy.manifest_modes(broken, manifest)
+
+
+def test_a_mode_s_streamed_joints_reach_its_state_with_their_rate(tmp_path) -> None:
+    """A policy that leaves joints to the host -- `jumper.quad_walk`'s arms, which
+    the crab gym's inverse kinematics moves -- says `stream_undriven` with the
+    fastest those targets may move, and both keys have to land on the composed
+    `[[fsm.state]]`: without the flag the controller holds those joints at the
+    contract's home pose whatever is streamed, and without the rate it refuses
+    the state. Read back as TOML. The control group is the mode that says
+    nothing, whose state carries neither key; and a value that is not a rate --
+    a bool, zero, a negative, a string -- is refused rather than written.
+    """
+    import copy
+
+    import tomllib
+
+    deploy = _deploy_module()
+    export = tmp_path / "export"
+    export.mkdir()
+    (export / "layout.json").write_text("{}", "utf-8")
+    (tmp_path / "cascade.toml").write_text(CASCADE, "utf-8")
+    manifest = tmp_path / "manifests.json"
+    spec = {"fsm": "cascade.toml", "modes": {
+        "walk": {"task": "jumper.tripod", "policy": str(export), "keys": {"key": ["keypad_1"]}},
+        "slow": {"task": "jumper.quad_walk", "policy": str(export), "pad": {"button": "A"},
+                 "stream_undriven": 2.5},
+    }}
+    modes, detail = deploy.manifest_modes(spec, manifest)
+    assert detail["slow"]["stream_undriven"] == 2.5, "bundle.json's built_from would not record it"
+    assert "stream_undriven" not in detail["walk"]
+    states = {s["name"]: s for s in tomllib.loads(
+        deploy.compose_fsm(spec, detail, {m: f"{m}.onnx" for m in modes}, manifest))["fsm"]["state"]}
+    assert states["slow"]["stream_undriven"] is True
+    assert states["slow"]["rate_limit"] == 2.5
+    assert "stream_undriven" not in states["walk"] and "rate_limit" not in states["walk"]
+
+    for bad in (True, 0, -1.0, "fast"):
+        broken = copy.deepcopy(spec)
+        broken["modes"]["slow"]["stream_undriven"] = bad
+        with pytest.raises(SystemExit, match="a number above zero"):
+            deploy.manifest_modes(broken, manifest)
+
+
 def test_each_device_s_switch_reaches_the_cascade_as_its_own_binding(tmp_path) -> None:
     """A mode's `pad` and `keys` switches arrive in the composed file as
     `[[fsm.button]]` entries of their own, one per key, all named after the

@@ -93,6 +93,16 @@ register(
     use="watching",
 )
 register(
+    id="bar",
+    description="**adds a pull-up bar**: 0.27 m above a 0.22 m platform, 0.11 m past its edge",
+    tags=("prop", "indoor"),
+    # `watching`, for the swing's reason: `jumper.pull_up` builds this rig itself,
+    # and `--scene bar` on top of it raises -- two rigs, one name. Selected for
+    # any other task it is a platform and a bar to walk up to, which is what a
+    # web simulator wants of it.
+    use="watching",
+)
+register(
     id="soft",
     description="**changes the ground**: default's look, but the feet sink into it",
     tags=("physics", "ground"),

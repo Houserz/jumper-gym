@@ -137,6 +137,9 @@ _DEPLOY_TERMS = frozenset({
     # the builder is: `obs.rs` builds it from the operator's command and the
     # term's own `neutral_height`.
     "posture_command",
+    # `jumper.pull_up`'s command: the rise above the hang, one raw metre value,
+    # built from the controller's `pull` channel (since 2026-10-06).
+    "pull_command",
 })
 
 #: The terms above that the controller can build **only from a recording**.
@@ -716,6 +719,13 @@ def _deploy_notes(obs_terms) -> list[str]:
             "params.neutral_height]: the command term's own order, the height "
             "centred on standing. Not the builder's `base_pose`, which is three of "
             "the same quantities ordered [pitch, roll, twist].",
+        ]
+    if any(t["name"] == "pull_command" for t in obs_terms):
+        notes += [
+            "pull_command is 1 float: the commanded rise above the straight-arm hang, "
+            "metres, raw -- no scale and no centring. The controller fills it from its "
+            "`pull` channel (the contract's controller block, or a host's "
+            "set_command_axes).",
         ]
     # There used to be a `base_lin_vel` warning here. It is gone because a note is
     # the wrong instrument: the bundle exported anyway, and the note was read by

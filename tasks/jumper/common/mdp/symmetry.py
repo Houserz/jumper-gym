@@ -148,6 +148,13 @@ _TERM_KIND = {
     # Only jumper.tripod mounts this term (see its env_cfg.py); the entry is inert
     # for the other three tasks, whose observation groups have no such key.
     "gait_phase": "phase_half_shift",
+    # jumper.pull_up's: how far above the straight-arm hang, asked for and
+    # achieved, and how far the centre of mass is out from under the bar along x.
+    # A height and a distance along the robot's own fore-aft line, so the mirror
+    # (y -> -y) leaves all three alone.
+    "pull_command": "scalar",
+    "pull_height": "scalar",
+    "com_offset": "scalar",
 }
 
 

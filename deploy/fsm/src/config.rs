@@ -59,6 +59,17 @@ pub enum When {
     InState(String),
     /// The operator's latched mode is this one.
     Button(String),
+    /// The **host** asked for this state by name, with no pad and no key in
+    /// between -- `Fsm.request_mode` in `play`'s extension, for an executor
+    /// that sequences modes itself (a script mounting a bar, a planner
+    /// chaining walk, mount, pull-ups and dismount). No other host supplies
+    /// one: the board and a browser pass nothing, so a rule reading it never
+    /// fires there, and a bundle aimed at a pad keeps its switches.
+    ///
+    /// Below the safety rules like a button, so a request cannot launch a
+    /// tilted or blind robot into anything; unlike a button, it needs no
+    /// `[[fsm.button]]`, since nothing on a pad or a keyboard presses it.
+    Request(String),
     /// Either gripper is engaged.
     GripperActive,
     /// The active state is a warm start and the measured pose reached its target.
@@ -77,6 +88,7 @@ impl When {
             other => match other.split_once(':') {
                 Some(("in_state", name)) if !name.is_empty() => When::InState(name.to_string()),
                 Some(("button", name)) if !name.is_empty() => When::Button(name.to_string()),
+                Some(("request", name)) if !name.is_empty() => When::Request(name.to_string()),
                 _ => return Err(Error::UnknownCondition(other.to_string())),
             },
         })
@@ -92,6 +104,7 @@ impl fmt::Display for When {
             When::CommandStale => f.write_str("command_stale"),
             When::InState(s) => write!(f, "in_state:{s}"),
             When::Button(b) => write!(f, "button:{b}"),
+            When::Request(r) => write!(f, "request:{r}"),
             When::GripperActive => f.write_str("gripper_active"),
             When::WarmStartReached => f.write_str("warm_start_reached"),
         }
@@ -142,6 +155,39 @@ pub struct StateConfig {
     pub hold_current: bool,
     #[serde(default)]
     pub warm_start: bool,
+    /// Follow joint targets the host streams (`Controller::set_joint_targets`),
+    /// at this state's `kp` / `kd`, each tick's move held to `rate_limit` and
+    /// every target to the joint stops. Runs no model: the targets are the
+    /// host's -- a scripted mount read out keyframe by keyframe, a vision loop
+    /// later -- and this is the one path by which something other than a
+    /// policy drives the joints. Nothing streamed yet holds the pose the
+    /// robot was last commanded to, so entering the state moves nothing.
+    #[serde(default)]
+    pub track_targets: bool,
+    /// The fastest a streamed target may move, rad/s, applied per tick on the
+    /// host's clock. **Required** on a `track_targets` state: a target that
+    /// steps is a servo asked for a step, and the stops alone do not catch it.
+    #[serde(default)]
+    pub rate_limit: f32,
+    /// On a policy state: the joints the policy does not drive follow the
+    /// targets the host streams (`Controller::set_joint_targets`) rather than
+    /// the contract's home pose, each tick's move held to `rate_limit` and
+    /// every target to the joint stops; the driven ones are the policy's as
+    /// ever. For a policy trained with some joints moved by someone else --
+    /// `jumper.quad_walk`'s arms, which the executor's inverse kinematics
+    /// moves while the policy walks on the other four legs. Nothing streamed
+    /// yet holds those joints where the last state left them, so entering the
+    /// state moves none of them; a `mode_switch_ramp_s` ramp, where there is
+    /// one, takes them to the home pose with every other joint first.
+    #[serde(default)]
+    pub stream_undriven: bool,
+    /// Freeze the last published target as this state is entered and hold it
+    /// at this state's `kp` / `kd` -- with position gain, unlike
+    /// `hold_current`'s damping. For a robot that must not go limp where it
+    /// is: hanging from a bar, where `safe`'s damping-only hold is a fall and
+    /// the pose it was in, claws shut, is the one thing to keep.
+    #[serde(default)]
+    pub hold_pose: bool,
     /// Suspend the tilt fallback **while active**. DANGEROUS -- a diverging
     /// policy will not drop to safe on its own. Only for motion that legitimately
     /// exceeds the limit, and never for the safe state itself.
@@ -553,6 +599,10 @@ pub enum Error {
     /// The safe state exempting itself from the tilt check would leave no
     /// attitude protection anywhere.
     SafeStateSkipsTilt,
+    /// A `track_targets` or `hold_pose` state that cannot do what it says: two
+    /// regimes on one state, no position gain, or a tracking state with no
+    /// rate limit.
+    Regime(String),
     /// A click gesture with no window to count it in, or a window of zero.
     ClickWindow(String),
     /// One control bound with a click gesture and with a gesture that reads a
@@ -657,6 +707,7 @@ impl fmt::Display for Error {
                  attitude protection anywhere",
             ),
             Error::ClickWindow(m) => f.write_str(m),
+            Error::Regime(m) => f.write_str(m),
             Error::ClickBeside { control, click, edge } => write!(
                 f,
                 "'{control}' is bound with a click gesture ({click}) and with one \
@@ -700,6 +751,71 @@ impl FsmConfig {
         if raw.states.iter().any(|s| s.name == raw.safe_state && s.skip_tilt_check) {
             return Err(Error::SafeStateSkipsTilt);
         }
+        // A state is one regime. Two on one state would be decided by the order
+        // `control.rs` happens to test them in, which is not something a file
+        // should be able to rely on; and a tracking or a holding state with no
+        // position gain is a robot going limp where it was told to stay.
+        for s in &raw.states {
+            let regimes = [
+                (s.has_model(), "model"),
+                (s.hold_current, "hold_current"),
+                (s.warm_start, "warm_start"),
+                (s.track_targets, "track_targets"),
+                (s.hold_pose, "hold_pose"),
+            ];
+            let on: Vec<&str> = regimes.iter().filter(|(set, _)| *set).map(|(_, n)| *n).collect();
+            if on.len() > 1 {
+                return Err(Error::Regime(format!(
+                    "state '{}' is {} at once; a state is one of them",
+                    s.name,
+                    on.join(" and ")
+                )));
+            }
+            if (s.track_targets || s.hold_pose) && !(s.kp > 0.0) {
+                return Err(Error::Regime(format!(
+                    "state '{}' holds a pose with kp = {}; it needs a position gain, or the \
+                     robot goes limp where it was told to stay",
+                    s.name, s.kp
+                )));
+            }
+            if s.stream_undriven && !s.has_model() {
+                return Err(Error::Regime(format!(
+                    "state '{}' streams the joints its policy does not drive and runs no \
+                     policy; a state with no model tracks streamed targets with track_targets",
+                    s.name
+                )));
+            }
+            if s.stream_undriven && s.hook.is_some() {
+                return Err(Error::Regime(format!(
+                    "state '{}' streams the joints its policy does not drive and has a hook; a \
+                     hook may present the robot in another frame (a mirror), where which joints \
+                     are undriven is not the contract's answer",
+                    s.name
+                )));
+            }
+            if s.stream_undriven && !(s.rate_limit > 0.0 && s.rate_limit.is_finite()) {
+                return Err(Error::Regime(format!(
+                    "state '{}' streams the joints its policy does not drive with rate_limit = \
+                     {}; it needs the fastest a target may move, in rad/s, or a target that \
+                     steps reaches the servos as a step",
+                    s.name, s.rate_limit
+                )));
+            }
+            if s.track_targets && !(s.rate_limit > 0.0 && s.rate_limit.is_finite()) {
+                return Err(Error::Regime(format!(
+                    "state '{}' tracks streamed targets with rate_limit = {}; it needs the \
+                     fastest a target may move, in rad/s, or a target that steps reaches the \
+                     servos as a step",
+                    s.name, s.rate_limit
+                )));
+            }
+            if s.rate_limit != 0.0 && !s.track_targets && !s.stream_undriven {
+                return Err(Error::Regime(format!(
+                    "state '{}' sets rate_limit and streams no targets; nothing reads it",
+                    s.name
+                )));
+            }
+        }
         for s in raw.states.iter().filter(|s| s.hook.is_some()) {
             if !s.has_model() {
                 return Err(Error::Hook(format!(
@@ -742,7 +858,7 @@ impl FsmConfig {
                     Enter::State(name.to_string())
                 }
             };
-            if let When::InState(name) = &when {
+            if let When::InState(name) | When::Request(name) = &when {
                 if !named(name) {
                     return Err(Error::UnknownState { rule: i, name: name.clone() });
                 }
@@ -1059,6 +1175,60 @@ enter = "locomotion"
 
 #[cfg(test)]
 mod tests {
+    /// A state is one regime, and the two that hold a pose need a position
+    /// gain and -- for tracking -- a rate. Each refusal is a file that would
+    /// load and do something other than it says: two regimes decided by the
+    /// order `control.rs` tests them, a hold with no gain that goes limp, a
+    /// tracking state that hands a stepped target straight to the servos.
+    /// The control group is the same states written well, which load.
+    #[test]
+    fn a_state_is_one_regime_and_a_held_pose_has_a_gain() {
+        let with = |state: &str| {
+            super::FsmConfig::parse(&format!("{}\n[[fsm.state]]\n{state}\n", super::EXAMPLE))
+        };
+        for (bad, why) in [
+            ("name = \"t\"\ntrack_targets = true\nrate_limit = 1.0\nkp = 10.0\nmodel = \"t.onnx\"", "model and track_targets"),
+            ("name = \"t\"\ntrack_targets = true\nhold_pose = true\nrate_limit = 1.0\nkp = 10.0", "track_targets and hold_pose"),
+            ("name = \"t\"\nhold_pose = true\nhold_current = true\nkp = 10.0", "hold_current and hold_pose"),
+            ("name = \"t\"\ntrack_targets = true\nrate_limit = 1.0", "kp = 0"),
+            ("name = \"t\"\nhold_pose = true\nkd = 0.5", "kp = 0"),
+            ("name = \"t\"\ntrack_targets = true\nkp = 10.0", "rate_limit = 0"),
+            ("name = \"t\"\nkp = 10.0\nrate_limit = 2.0", "rate_limit and streams no targets"),
+            ("name = \"t\"\nstream_undriven = true\nrate_limit = 2.0", "runs no"),
+            ("name = \"t\"\nmodel = \"t.onnx\"\nstream_undriven = true", "rate_limit = 0"),
+        ] {
+            let e = with(bad).unwrap_err();
+            assert!(matches!(&e, super::Error::Regime(m) if m.contains(why)), "{bad}: {e}");
+        }
+        for good in [
+            "name = \"t\"\ntrack_targets = true\nrate_limit = 1.0\nkp = 10.0\nkd = 0.5",
+            "name = \"t\"\nhold_pose = true\nkp = 10.0\nkd = 0.5\nskip_tilt_check = true",
+            "name = \"t\"\nmodel = \"t.onnx\"\nstream_undriven = true\nrate_limit = 2.0",
+        ] {
+            with(good).unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
+    }
+
+    /// `request:<state>` names a state the file declares, like `in_state:`;
+    /// a request for a state nobody declared is a rule that can never fire,
+    /// which is the failure every unknown name here is refused for. The
+    /// control group names a declared one and loads.
+    #[test]
+    fn a_request_names_a_declared_state() {
+        let with = |name: &str| {
+            super::FsmConfig::parse(&super::EXAMPLE.replacen(
+                "[[fsm.rule]]\nwhen = \"button:jump\"",
+                &format!("[[fsm.rule]]\nwhen = \"request:{name}\"\nenter = \"jump\"\n\n[[fsm.rule]]\nwhen = \"button:jump\""),
+                1,
+            ))
+        };
+        let e = with("mount").unwrap_err();
+        assert!(matches!(&e, super::Error::UnknownState { name, .. } if name == "mount"), "{e}");
+        let cfg = with("jump").unwrap();
+        assert!(cfg.rules.iter().any(|r| r.when == super::When::Request("jump".into())));
+        assert_eq!(super::When::Request("jump".into()).to_string(), "request:jump");
+    }
+
     #[test]
     fn a_key_the_dictionary_does_not_know_is_refused() {
         // This check did not exist. `pad` and `with` were validated against the

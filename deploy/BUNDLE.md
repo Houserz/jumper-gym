@@ -262,8 +262,12 @@ gain is a robot that moves, and a defaulted timeout is a fallback that never fir
 | `model` | `""` | non-empty makes the state a **mode**: it runs a policy, and needs a contract and a `bundle.json` entry of the same name. The value is not used to find the file |
 | `hold_current` | false | damping only, around whatever pose the robot is in |
 | `warm_start` | false | slide to `warm_start_ref`'s home pose at this state's `kp` / `kd` |
-| `skip_tilt_check` | false | suspend `tilted` while this state is active. Refused on `safe_state` |
-| `kp`, `kd` | 0 | the gains of a state that runs no policy |
+| `skip_tilt_check` | false | suspend `tilted` while this state is active. Refused on `safe_state`. A manifest mode sets it with `"skip_tilt_check": true` beside its `export` |
+| `track_targets` | false | follow joint targets the host streams (`set_joint_targets`, wire order, rad) at `kp` / `kd`, moving each joint toward its target no faster than `rate_limit`. Until the first stream the pose it entered with is held. The gym bundle's `track` state, which the executor's scripted climb streams through |
+| `stream_undriven` | false | on a mode: the joints its policy does not drive follow the targets the host streams (`set_joint_targets`) instead of the contract's home pose, each no faster than `rate_limit`, within the stops; the driven joints stay the policy's. Until the first stream they stay where the last state left them. Refused on a state with no `model` or with a `hook`. A manifest mode sets it with `"stream_undriven": <rad/s>`, which writes both keys. The gym bundle's `quad_walk`, whose arms the executor's inverse kinematics moves while the policy walks |
+| `rate_limit` | — | rad/s, required with `track_targets` or `stream_undriven` and refused without one |
+| `hold_pose` | false | freeze the target the state was entered with and hold it at `kp` / `kd` -- the pose, unlike `hold_current`, which only damps. The gym bundle's `hang` |
+| `kp`, `kd` | 0 | the gains of a state that runs no policy. Required (> 0) by `track_targets` and `hold_pose` |
 | `kp_scale`, `kd_scale`, `kp_offset`, `kd_offset` | 1, 1, 0, 0 | a mode's gain is `contract kp × kp_scale + kp_offset`, likewise `kd`: the trained gain stays in the contract and the bench trim here |
 | `command_terms` | `[]` | the channels this mode's `commands` term carries, in order. Empty takes the host's list, `lin_vel_x`, `lin_vel_y`, `yaw_rate` |
 | `task` | `""` | the task the mode's policy was trained on, as the bundler records it. Informative, and what `hook` is looked up by |
@@ -312,6 +316,7 @@ rebuilt from a table.
 | `warm_start_reached` | the active state is a warm start and the measured pose has arrived |
 | `in_state:<state>` | the active state is `<state>` |
 | `button:<name>` | the `[[fsm.button]]` called `<name>` is active |
+| `request:<state>` | the host has asked for `<state>` by name (`request_mode`) and not withdrawn it. `<state>` has to be declared; a request for one that is not is refused by the host call, never silently ignored. An executor's way to a state, below the safety rules like a button |
 | `gripper_active` | never — no host supplies a gripper, so a config that reads it is refused |
 | `always` | always. **The last rule has to be `always`, and no other rule may be**, so the cascade is total |
 
@@ -402,7 +407,7 @@ What the controller reads:
 | `action_joint_order` | yes | the joints the action drives, in the action's order; as long as `action.dim`. Paired by name |
 | `default_joint_pos` | yes | `{joint: rad}` covering **every** wire joint, driven or not. Joints the policy does not drive are held here |
 | `joint_limits` | board | `{joint: [lo, hi]}` in the same radians: every joint or none, `lo < hi`, the home pose inside. Every commanded target is clamped to it. The board refuses a contract without it — it has no model to read stops off — and so does the bundler, for a bundle that carries the board's runtime; a simulator falls back to its own model |
-| `action_scale` | yes | a number: `target = baseline + action_scale × action`, the baseline being the home pose or a recording |
+| `action_scale` | yes | a number, or a map from every driven joint's name to one: `target = baseline + action_scale × action`, the baseline being the home pose or a recording. A map that misses a driven joint, or names one that is not, is refused at load |
 | `control.kp` `control.kd` `control.effort_limit` | yes | numbers: the trained PD gains and torque limit, before the state's trim |
 | `control.control_hz` | yes | this mode's inference rate, > 0. Each mode infers at its own |
 | `control.action_filter_cutoff_hz` | no | cutoff of an output EMA between inferences. Absent or 0 is a zero-order hold, which is every export today |
@@ -414,7 +419,7 @@ What the controller reads:
 | `controller` | no | how a pad and a keyboard become the command. `operator_controller/2` only — below |
 | `reference` | no | the recording the mode is driven by — see the next section |
 
-`kp`, `kd`, `effort_limit` and `action_scale` have to be numbers. The exporter writes a
+`kp`, `kd`, `effort_limit` have to be numbers, `action_scale` a number or a map. The exporter writes a
 `{joint: value}` map instead when joints differ, and the controller refuses that contract
 with a JSON type error; no task produces one today.
 
@@ -442,6 +447,7 @@ keeps a copy and `tests/test_layout.py` holds the two equal.
 | `commands` — also read as `velocity_commands`, `jump_command`, `jump_go` | one per channel | the state's `command_terms`, or the host's list |
 | `commands_diff` | one per channel | the same |
 | `posture_command` | 4 | `params.neutral_height`: `[twist, pitch, roll, height − neutral_height]` |
+| `pull_command` | 1 | the command's `pull` channel, metres: how far above the straight-arm hang to hold the body (`jumper.pull_up`). The executor streams it through `set_command_axes`, as a trigger would |
 | `joint_pos`, `joint_vel`, `joint_torque` | `len(obs_joint_order)` | `joint_pos` is relative to the home pose |
 | `actions` | `action.dim` | the previous action |
 | `gait_phase` | 2 | `params.period` in s for a fixed clock, or `stride`, `freq_min`, `freq_max` and `turn_radius` for one that follows the command. `params.command_threshold` gates it to `(0, 0)` while standing. `params.advance`, on the second kind: `"after_frame"` builds each frame with the phase as it stands and then advances it by that frame's command; absent advances it by each frame's own command before building it, the first frame excepted -- the order of every export from before the field. Any other value is refused |
@@ -927,6 +933,16 @@ names another, is the world only. Pointed at the build directory it refuses and 
 `.app` inside. `deploy.py --check-reference` checks this machine's extension, given the
 bundle or the build directory around it, and refuses a bundle that carries none for this
 platform.
+
+**An executor instead of a person.** `AppPlayer(..., executor=True)` reads no keyboard
+and no pad; the program driving it has the controller's own entry points on the
+extension -- `request_mode(name)` for a `request:<name>` rule, `set_command_axes` for the
+channels a mode's `commands` term carries (`lin_vel_x` ... `pull`, in their physical units),
+`set_joint_targets` for a `track_targets` state, `press(key)` for a gesture the bundle puts
+on a key -- and steps the world itself, one control step at a time, so nothing moves while
+it thinks. `crabgym` is the one there is (`docs/CRABGYM.md`); its climb onto the pull-up
+bar is some twenty seconds of streamed targets, each solved from the robot's own joints
+and IMU a moment before.
 
 ## What a bundle does not carry
 

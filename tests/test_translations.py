@@ -40,6 +40,11 @@ MARKER = re.compile(
 #: skill triggers at all, so those stay in one language.
 ROOTS = ("", "docs", "deploy", "notebooks")
 
+#: Searched all the way down: a task's README may carry a translation beside it
+#: (`tasks/jumper/pull_up/README.zh.md`), and a task lives at whatever depth its id
+#: puts it.
+TASKS = "tasks"
+
 
 def digest_of(path: Path) -> str:
     """The first 16 hex of the source's SHA-256. Short enough to read in a diff."""
@@ -50,6 +55,7 @@ def translations() -> list[Path]:
     found: list[Path] = []
     for root in ROOTS:
         found += sorted((REPO / root).glob("*.zh.md"))
+    found += sorted((REPO / TASKS).rglob("*.zh.md"))
     return found
 
 

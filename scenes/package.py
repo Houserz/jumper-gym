@@ -87,6 +87,7 @@ import re
 import shutil
 import tempfile
 import zipfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -497,7 +498,7 @@ def _check_world(path: Path) -> None:
             raise PackageError(f"{path.name} carries <{tag}>: {why}.")
 
 
-def load_package(source: str | Path) -> Scene:
+def load_package(source: str | Path, *, keep_bodies: Iterable[str] = ()) -> Scene:
     """Read a package and return the `Scene` that puts it on screen.
 
     The textures, materials and lights the terrain entity would otherwise carry
@@ -511,6 +512,15 @@ def load_package(source: str | Path) -> Scene:
     a generated one would first have moved every environment origin onto its own
     sub-terrain grid, away from the origin the spawn was moved to. A package that
     names no ground keeps the task's.
+
+    `keep_bodies` names static bodies of the world, by the names the package
+    gives them, whose geometry is **not** moved into the terrain: it stays in
+    its own body, attached under the package's prefix. For a thing the robot
+    holds rather than stands on -- the crab gym's pull-up bar -- whose contacts
+    have to be told from the ground's: which parts of the robot touch it, and
+    how far the claws seat from its axis. Opt-in, because a foot on a body the
+    terrain does not include reads as a foot in the air. A name that is no body
+    of the world is refused rather than kept for nothing.
     """
     import mujoco
 
@@ -527,7 +537,11 @@ def load_package(source: str | Path) -> Scene:
     data = mujoco.MjData(model)
     mujoco.mj_kinematics(model, data)
     pos, quat = _placement(package, model, data)
-    terrain = _Terrain.of(package, model, data, pos, quat)
+    keep = tuple(keep_bodies)
+    for name in keep:
+        if mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, str(name)) < 0:
+            raise PackageError(f"keep_bodies names {name!r}, which is not a body of the world.")
+    terrain = _Terrain.of(package, model, data, pos, quat, keep=keep)
 
     def decorate(spec: Any) -> None:
         world = package.spec(world_file)
@@ -653,11 +667,18 @@ class _Terrain:
 
     @classmethod
     def of(cls, package: ScenePackage, model: Any, data: Any,
-           pos: list[float], quat: list[float]) -> _Terrain:
+           pos: list[float], quat: list[float], keep: tuple[str, ...] = ()) -> _Terrain:
         import mujoco
         import numpy as np
 
         ground = package.ground
+        if ground is not None:
+            gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, ground)
+            holder = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, int(model.geom_bodyid[gid])) \
+                if gid >= 0 else None
+            if holder in keep:
+                raise PackageError(f"keep_bodies names {holder!r}, which holds the ground "
+                                   f"{ground!r}; the ground is the terrain by definition.")
         if ground is not None:
             gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, ground)
             if gid < 0:
@@ -675,6 +696,9 @@ class _Terrain:
         geoms: list[dict[str, Any]] = []
         for gid in range(model.ngeom):
             if not _collides(model, gid) or model.body_weldid[model.geom_bodyid[gid]] != 0:
+                continue
+            # A kept body's geoms stay with it, attached as they are.
+            if mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, int(model.geom_bodyid[gid])) in keep:
                 continue
             name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, gid)
             kind = mujoco.mjtGeom(int(model.geom_type[gid]))

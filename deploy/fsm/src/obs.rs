@@ -291,6 +291,9 @@ const SUPPORTED: &[&str] = &[
     "commands_diff",
     // `jumper.posture`'s second command: twist, pitch, roll, height.
     "posture_command",
+    // `jumper.pull_up`'s command: the rise above the hang, m, as the operator
+    // or an executor sets it.
+    "pull_command",
     "joint_pos",
     "joint_vel",
     "joint_torque",
@@ -320,6 +323,7 @@ fn term_width(
         "base_lin_vel" | "base_ang_vel" | "projected_gravity" | "base_pose" => 3,
         "commands" | "commands_diff" => n_cmd,
         "posture_command" => 4,
+        "pull_command" => 1,
         "joint_pos" | "joint_vel" | "joint_torque" => obs_joints,
         "actions" => action_dim,
         "gait_phase" => 2,
@@ -665,6 +669,10 @@ impl ObservationBuilder {
                         self.frame.push(v * s.commands);
                     }
                 }
+                // Raw, as `jumper.pull_up` observes it: metres above the
+                // hang, no scale and no centring, the command term's own
+                // value handed through `generated_commands`.
+                "pull_command" => self.frame.push(command.pull * s.commands),
                 "commands_diff" => {
                     for i in 0..self.n_cmd {
                         let name = self.cfg.command_terms[i].clone();
@@ -1301,6 +1309,21 @@ mod tests {
         // than built uncentred -- 0.107 m out on that channel, for ever.
         let e = ObservationBuilder::new(cfg(&["posture_command"], &[1]), &c, 1).err();
         assert!(matches!(e, Some(Error::MissingParam { .. })), "{e:?}");
+    }
+
+    /// `pull_command` is the commanded rise, raw: one value, metres, as
+    /// `jumper.pull_up` observes its command term. Not `height`, which is the
+    /// posture's channel and sits in another field -- the control: a command
+    /// with a height and no pull shows the policy zero.
+    #[test]
+    fn pull_command_is_the_commanded_rise_raw() {
+        let c = contract(1, r#"[{"name":"pull_command","dim":1}]"#, 1);
+        let mut b = ObservationBuilder::new(cfg(&["pull_command"], &[1]), &c, 1).unwrap();
+        let cmd = Command { pull: 0.07, height: 0.12, ..Default::default() };
+        let out = b.build(&state(), &cmd, &[0.0], &[0.0]).unwrap();
+        assert_eq!(out, [0.07]);
+        let out = b.build(&state(), &Command { height: 0.12, ..Default::default() }, &[0.0], &[0.0]).unwrap();
+        assert_eq!(out, [0.0], "the height is not the pull");
     }
 
     /// The tempo follows the command, integrated: first frame at phase 0, each

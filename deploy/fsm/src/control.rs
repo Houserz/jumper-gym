@@ -84,6 +84,10 @@ pub struct TickInput<'a> {
     pub command_fresh: bool,
     /// The operator's latched mode, matched against `button:<name>` rules.
     pub buttons: &'a std::collections::BTreeSet<String>,
+    /// The state the host itself asks for, matched against `request:<name>`
+    /// rules (`config::When::Request`). `None` from a host with no such path,
+    /// which is every host but `play`'s extension.
+    pub request: Option<&'a str>,
     pub gripper_active: bool,
     /// The controls a task answers itself -- `controls.yaml`'s `task:`, by
     /// name -- for a mode with no operator in `operators`, as the host read
@@ -109,6 +113,9 @@ struct ModeRuntime {
     home: Vec<f32>,
     /// The task's hook, for a mode whose manifest entry asked for one.
     hook: Option<HookRuntime>,
+    /// The wire joints the policy does not drive: what a `stream_undriven`
+    /// state hands to the host's stream.
+    undriven: Vec<usize>,
 }
 
 /// A mode's hook (`hook.rs`), and what the decoder carries between ticks in the
@@ -186,6 +193,20 @@ pub struct Controller {
     /// The published position, after the output-rate filter.
     pos_des: Vec<f32>,
     alpha: f32,
+    /// The joint targets the host last streamed, wire order, for a
+    /// `track_targets` state (`set_joint_targets`). `None` until it streams
+    /// one; the state then holds the last published target instead.
+    streamed: Option<Vec<f32>>,
+    /// The tick the tracking regime last moved on, so its rate limit is a
+    /// speed on the host's clock rather than a step per call.
+    tracked_at: Option<Micros>,
+    /// The inference a `stream_undriven` state last moved the undriven joints
+    /// on: their rate limit is a speed on the host's clock, as tracking's is.
+    undriven_at: Option<Micros>,
+    /// What a `hold_pose` state froze as it was entered, and which state: the
+    /// pose is taken once, on entry, and the name is how entry is told from
+    /// another tick of the same state.
+    frozen: Option<(String, Vec<f32>)>,
 }
 
 #[derive(Debug)]
@@ -196,6 +217,9 @@ pub enum Error {
     /// `resume` was called when nothing was pending, or with the wrong width.
     NotPending,
     ActionWidth { got: usize, want: usize },
+    /// `set_joint_targets` was handed a vector that is not one target per
+    /// wire joint.
+    TargetWidth { got: usize, want: usize },
     /// A state names a model, but no contract was installed for it.
     NoContract(String),
     /// A mode's recorded motion names a `go` button the cascade does not
@@ -222,6 +246,11 @@ impl std::fmt::Display for Error {
             Error::ActionWidth { got, want } => write!(
                 f,
                 "the model returned {got} values and this mode's action is {want} wide"
+            ),
+            Error::TargetWidth { got, want } => write!(
+                f,
+                "{got} joint targets were streamed and this robot has {want} joints on the \
+                 wire; a tracking state takes one target per wire joint, in wire order"
             ),
             Error::NoContract(s) => write!(
                 f,
@@ -337,7 +366,7 @@ impl Controller {
             joints,
             hold: ActionDecoder::new(
                 crate::action::ActionConfig {
-                    scale: 0.0,
+                    scale: vec![],
                     clip: 0.0,
                     smoothing: 0.0,
                     effort_limit: f32::INFINITY,
@@ -366,7 +395,28 @@ impl Controller {
             target: default_wire.clone(),
             pos_des: default_wire,
             alpha: 1.0,
+            streamed: None,
+            tracked_at: None,
+            undriven_at: None,
+            frozen: None,
         })
+    }
+
+    /// Joint targets for a `track_targets` state, wire order, from the host.
+    ///
+    /// Kept whatever state is active and read only by a tracking one: an
+    /// executor streams every tick, and a target that arrived while a policy
+    /// was running is simply the one the tracking state starts from when it is
+    /// entered. The width is checked here, once, rather than at every tick.
+    pub fn set_joint_targets(&mut self, targets: &[f32]) -> Result<(), Error> {
+        if targets.len() != self.joints {
+            return Err(Error::TargetWidth { got: targets.len(), want: self.joints });
+        }
+        match self.streamed.as_mut() {
+            Some(s) => s.copy_from_slice(targets),
+            None => self.streamed = Some(targets.to_vec()),
+        }
+        Ok(())
     }
 
     pub fn state(&self) -> &StateConfig {
@@ -431,6 +481,7 @@ impl Controller {
                 command_fresh: input.command_fresh,
                 tilt: input.state.imu.valid.then(|| tilt_angle(input.state.imu.quat)),
                 buttons: input.buttons.clone(),
+                request: input.request.map(str::to_string),
                 gripper_active: input.gripper_active,
                 pose_reached: warm_target
                     .map(|t| pose_reached(&input.state.q, t, cfg.pose_reach_tol))
@@ -445,6 +496,30 @@ impl Controller {
             self.enter_hold(&mode_name);
             self.slide(&target, state.kp, state.kd, input.state, now, self.fsm.config().warm_start_duration_s);
             return Ok(Step::Hold);
+        }
+
+        // The two regimes that drive the joints without a model, each on fresh
+        // feedback only -- stale feedback is `hold_still`'s below, for them as
+        // for a policy. Both clear the active mode, so a policy entered after
+        // them starts as from any hold: ramped, or seeded where it stands.
+        if state.track_targets && input.state_fresh {
+            self.enter_hold(&mode_name);
+            self.track(&state, input.state, now);
+            return Ok(Step::Hold);
+        }
+        if state.hold_pose && input.state_fresh {
+            self.enter_hold(&mode_name);
+            self.hold_pose(&state, input.state);
+            return Ok(Step::Hold);
+        }
+        if !state.track_targets {
+            self.tracked_at = None;
+        }
+        if !state.stream_undriven {
+            self.undriven_at = None;
+        }
+        if !state.hold_pose {
+            self.frozen = None;
         }
 
         let runs_model = state.has_model()
@@ -626,8 +701,34 @@ impl Controller {
                 }
             }
         }
+        self.stream_undriven(&name);
         self.publish_new_target();
         Ok(&self.cmd)
+    }
+
+    /// On a `stream_undriven` state, the joints the policy does not drive:
+    /// toward what the host streamed, at most `rate_limit` rad/s from the last
+    /// published target, within the stops -- `track`'s rule, on the policy's
+    /// own ticks. The decoder has just put them at the home pose; this puts
+    /// them back where the stream says, so a state entered with nothing
+    /// streamed leaves them where the last state did.
+    fn stream_undriven(&mut self, name: &str) {
+        let state = self.fsm.current();
+        if !state.stream_undriven {
+            return;
+        }
+        let rate = state.rate_limit;
+        let now = self.last_infer.unwrap_or(0);
+        let dt = self.undriven_at.map_or(0.0, |t| now.saturating_sub(t) as f32 / 1e6);
+        self.undriven_at = Some(now);
+        let step = rate * dt;
+        let mode = &self.modes[name];
+        let (lo, hi) = mode.act.limits();
+        for &w in &mode.undriven {
+            let from = self.target[w];
+            let wanted = self.streamed.as_ref().map_or(from, |s| s[w]);
+            self.cmd.pos[w] = wanted.clamp(from - step, from + step).clamp(lo[w], hi[w]);
+        }
     }
 
     // ── regimes ─────────────────────────────────────────────────────────
@@ -711,6 +812,46 @@ impl Controller {
 
     fn hold_still(&mut self, state: &RobotState, kd: f32) {
         self.hold.hold(state, kd, &mut self.prev_target, &mut self.cmd, &mut self.applied_torque);
+        self.alpha = 1.0;
+        self.publish_new_target();
+    }
+
+    /// The tracking regime: toward what the host streamed, at most
+    /// `rate_limit` rad/s from the last published target, at the state's gains.
+    ///
+    /// Measured from the published target rather than the measured pose, so a
+    /// joint held off its target by a load is not walked further away by the
+    /// limit; and on the clock rather than per call, so a host ticking at 1 kHz
+    /// and one at 50 Hz move a target at the same speed. The first tick in the
+    /// state moves nothing: it has no interval to move over, and nothing
+    /// streamed yet is the pose the robot was last told to hold.
+    fn track(&mut self, state: &StateConfig, robot: &RobotState, now: Micros) {
+        let dt = self.tracked_at.map_or(0.0, |t| now.saturating_sub(t) as f32 / 1e6);
+        self.tracked_at = Some(now);
+        let step = state.rate_limit * dt;
+        let mut pose = self.target.clone();
+        if let Some(wanted) = self.streamed.as_ref() {
+            for w in 0..self.joints {
+                pose[w] = wanted[w].clamp(pose[w] - step, pose[w] + step);
+            }
+        }
+        self.hold.command_pose(&pose, robot, state.kp, state.kd, &mut self.cmd, &mut self.applied_torque);
+        self.alpha = 1.0;
+        self.publish_new_target();
+    }
+
+    /// The holding regime: the target published as the state was entered,
+    /// frozen, and driven to at the state's gains until the state is left.
+    fn hold_pose(&mut self, state: &StateConfig, robot: &RobotState) {
+        let fresh = match self.frozen.as_ref() {
+            Some((name, _)) if *name == state.name => false,
+            _ => true,
+        };
+        if fresh {
+            self.frozen = Some((state.name.clone(), self.target.clone()));
+        }
+        let pose = self.frozen.as_ref().map(|(_, p)| p.clone()).expect("frozen above");
+        self.hold.command_pose(&pose, robot, state.kp, state.kd, &mut self.cmd, &mut self.applied_torque);
         self.alpha = 1.0;
         self.publish_new_target();
     }
@@ -800,7 +941,7 @@ fn build_mode(
     // mode's HOME would have folded it back the moment the policy took over.
     let act = ActionDecoder::new(
         crate::action::ActionConfig {
-            scale: contract.layout.action_scale,
+            scale: contract.action_scale.clone(),
             clip: setup.action_clip,
             smoothing: setup.action_smoothing,
             effort_limit: control.effort_limit,
@@ -876,7 +1017,11 @@ fn build_mode(
             contract.default_wire.len()
         )));
     }
+    let undriven = (0..contract.default_wire.len())
+        .filter(|w| !contract.action_wire_idx.contains(w))
+        .collect();
     Ok(ModeRuntime {
+        undriven,
         infer_period_us: (1e6 / hz) as u64,
         alpha: ema_alpha_from_cutoff(control.action_filter_cutoff_hz, output_dt_s),
         shaper,
@@ -1733,6 +1878,7 @@ mod tests {
             state_fresh: true,
             command_fresh: true,
             buttons: &NONE,
+            request: None,
             gripper_active: false,
             controls: &IDLE,
         }
@@ -2391,6 +2537,309 @@ mod tests {
         }
         // action_scale 0.25, use_default_offset around home 0: the target is 0.25.
         assert!((last - 0.25).abs() < 0.01, "converged to {last}, not the decoded target");
+    }
+
+    // ── The two regimes that drive the joints without a model ─────────────
+
+    /// A cascade an executor drives: a tracking state and a holding state
+    /// beside two policies, each entered by a host's request and nothing a
+    /// pad presses. Gains and rate are round numbers the assertions read.
+    const EXECUTOR: &str = r#"
+[fsm]
+initial_state = "locomotion"
+warm_start_ref = "locomotion"
+safe_state = "safe"
+tilt_limit = 0.8
+state_timeout_ms = 100
+command_timeout_ms = 500
+mode_switch_ramp_s = 0.0
+pose_reach_tol = 0.10
+warm_start_duration_s = 0.0
+ramp_kp = 0.15
+ramp_kd = 0.01
+
+[[fsm.state]]
+name = "safe"
+hold_current = true
+kd = 0.01
+
+[[fsm.state]]
+name = "track"
+track_targets = true
+rate_limit = 1.0
+kp = 7.0
+kd = 0.3
+skip_tilt_check = true
+
+[[fsm.state]]
+name = "hang"
+hold_pose = true
+kp = 9.0
+kd = 0.4
+skip_tilt_check = true
+
+[[fsm.state]]
+name = "locomotion"
+model = "locomotion.onnx"
+
+[[fsm.state]]
+name = "pull_up"
+model = "pull_up.onnx"
+skip_tilt_check = true
+
+[[fsm.rule]]
+when = "feedback_stale"
+enter = "safe"
+
+[[fsm.rule]]
+when = "tilted"
+enter = "safe"
+
+[[fsm.rule]]
+when = "in_state:safe"
+enter = "@initial"
+
+[[fsm.rule]]
+when = "request:hang"
+enter = "hang"
+
+[[fsm.rule]]
+when = "request:track"
+enter = "track"
+
+[[fsm.rule]]
+when = "request:pull_up"
+enter = "pull_up"
+
+[[fsm.rule]]
+when = "always"
+enter = "locomotion"
+"#;
+
+    fn executor() -> Controller {
+        let cfg = FsmConfig::parse(EXECUTOR).unwrap();
+        let mut contracts = HashMap::new();
+        for name in ["locomotion", "pull_up"] {
+            contracts.insert(name.to_string(), contract([0.1, 0.1], 50.0, 0.0));
+        }
+        Controller::new(cfg, setup(), contracts, 0).unwrap()
+    }
+
+    /// One tick with the host asking for `request`, the robot at `q`.
+    fn ask(c: &mut Controller, request: Option<&str>, q: [f32; 2], now: Micros) -> Step {
+        let s = at(q);
+        let cmd = Command::default();
+        let i = TickInput { request, ..input(&s, &cmd) };
+        c.tick(&i, now).unwrap()
+    }
+
+    /// A tracking state moves the published target toward what the host
+    /// streamed, no faster than its rate on the host's clock, clamped to the
+    /// stops, at its own gains -- and before anything is streamed it holds
+    /// what was last published, so entering it moves nothing. The first tick
+    /// has no interval to move over and is the control group for the rate:
+    /// the pose it publishes is exactly the one it found.
+    #[test]
+    fn a_tracking_state_follows_streamed_targets_at_its_rate() {
+        let mut c = executor();
+        let q = [0.1f32, 0.1];
+        // The policy publishes its home pose first.
+        assert!(matches!(ask(&mut c, None, q, 0), Step::Infer { .. }));
+        c.resume(&[0.0, 0.0]).unwrap();
+        let found = c.command().pos.clone();
+
+        // Entered with nothing streamed: held where it was, at the state's gains.
+        ask(&mut c, Some("track"), q, 1_000);
+        assert_eq!(c.state().name, "track");
+        assert_eq!(c.command().pos, found, "nothing streamed holds the last target");
+        assert_eq!((c.command().kp[0], c.command().kd[0]), (7.0, 0.3));
+        assert!(!c.is_running_policy());
+
+        // Streamed a target 5 rad away on one joint and past the stop on the
+        // other: 1 rad/s, so 0.1 rad after 100 ms, and never past 3.3.
+        c.set_joint_targets(&[5.0, 9.0]).unwrap();
+        for tick in 1..=100u64 {
+            ask(&mut c, Some("track"), q, 1_000 + tick * 1_000);
+        }
+        let p = c.command().pos.clone();
+        assert!((p[0] - (found[0] + 0.1)).abs() < 1e-4, "moved {} in 100 ms at 1 rad/s", p[0] - found[0]);
+        for tick in 101..=5_000u64 {
+            ask(&mut c, Some("track"), q, 1_000 + tick * 1_000);
+        }
+        let p = c.command().pos.clone();
+        assert!((p[0] - 3.3).abs() < 1e-5, "the stop, not the 5 rad asked for: {}", p[0]);
+        assert!((p[1] - 3.3).abs() < 1e-5, "{}", p[1]);
+
+        // One target per wire joint, or nothing is taken.
+        assert!(matches!(c.set_joint_targets(&[1.0]), Err(Error::TargetWidth { got: 1, want: 2 })));
+    }
+
+    /// A policy whose contract drives joint `a` only, `b` left to someone else.
+    fn half_contract() -> Contract {
+        let text = r#"{"obs_joint_order": ["a","b"], "action_joint_order": ["a"],
+            "action_scale": 0.25,
+            "default_joint_pos": {"a": 0.1, "b": 0.1},
+            "control": {"kp": 10.0, "kd": 0.5, "effort_limit": 2.0,
+                         "control_hz": 50.0, "action_filter_cutoff_hz": 0.0},
+            "observation": {"dim": 5, "history_length": 1,
+                             "terms": [{"name":"joint_pos","dim":2},
+                                       {"name":"joint_vel","dim":2},
+                                       {"name":"actions","dim":1}]},
+            "action": {"dim": 1}}"#;
+        Contract::from_str(text, &JOINTS.map(String::from)).unwrap()
+    }
+
+    /// A `stream_undriven` policy state: the joint the policy does not drive
+    /// follows the host's stream at the state's rate, from where the last
+    /// state left it, while the driven one is the policy's. The control group
+    /// is the same policy without the flag, which holds the undriven joint at
+    /// the contract's home -- the decoder's rule, and the reason for the flag.
+    #[test]
+    fn a_policy_state_can_hand_its_undriven_joints_to_the_stream() {
+        let config = |flag: &str| {
+            EXECUTOR.replace(
+                "[[fsm.state]]\nname = \"pull_up\"",
+                &format!(
+                    "[[fsm.state]]\nname = \"quad\"\nmodel = \"quad.onnx\"\n{flag}\n\n\
+                     [[fsm.rule]]\nwhen = \"request:quad\"\nenter = \"quad\"\n\n\
+                     [[fsm.state]]\nname = \"pull_up\""
+                ),
+            )
+        };
+        let build = |flag: &str| {
+            let cfg = FsmConfig::parse(&config(flag)).unwrap();
+            let mut contracts = HashMap::new();
+            for name in ["locomotion", "pull_up"] {
+                contracts.insert(name.to_string(), contract([0.1, 0.1], 50.0, 0.0));
+            }
+            contracts.insert("quad".to_string(), half_contract());
+            Controller::new(cfg, setup(), contracts, 0).unwrap()
+        };
+        let q = [0.1f32, 0.1];
+        // Left by `track` at b = 0.9: the pose the policy state is entered from.
+        let into_quad = |c: &mut Controller| {
+            ask(c, Some("track"), q, 0);
+            c.set_joint_targets(&[0.1, 0.9]).unwrap();
+            for tick in 1..=2_000u64 {
+                ask(c, Some("track"), q, tick * 1_000);
+            }
+            assert!((c.command().pos[1] - 0.9).abs() < 1e-5);
+            for tick in 2_001..=2_100u64 {
+                if let Step::Infer { .. } = ask(c, Some("quad"), q, tick * 1_000) {
+                    c.resume(&[0.4]).unwrap();
+                }
+            }
+            assert_eq!(c.state().name, "quad");
+        };
+
+        let mut c = build("stream_undriven = true\nrate_limit = 1.0");
+        into_quad(&mut c);
+        let p = c.command().pos.clone();
+        assert!((p[0] - (0.1 + 0.25 * 0.4)).abs() < 1e-5, "the policy drives a: {}", p[0]);
+        assert!((p[1] - 0.9).abs() < 1e-5, "b stays where track left it, not home: {}", p[1]);
+        // Streamed to -0.5: 1 rad/s on the policy's ticks, so 0.5 rad in 0.5 s.
+        c.set_joint_targets(&[3.0, -0.5]).unwrap();
+        for tick in 2_101..=2_600u64 {
+            if let Step::Infer { .. } = ask(&mut c, Some("quad"), q, tick * 1_000) {
+                c.resume(&[0.4]).unwrap();
+            }
+        }
+        let p = c.command().pos.clone();
+        assert!((p[1] - 0.4).abs() < 0.03, "b moved 0.5 rad in 0.5 s at 1 rad/s: {}", p[1]);
+        assert!((p[0] - 0.2).abs() < 1e-5, "a is the policy's, not the stream's 3.0: {}", p[0]);
+        for tick in 2_601..=5_000u64 {
+            if let Step::Infer { .. } = ask(&mut c, Some("quad"), q, tick * 1_000) {
+                c.resume(&[0.4]).unwrap();
+            }
+        }
+        assert!((c.command().pos[1] + 0.5).abs() < 1e-5, "{}", c.command().pos[1]);
+
+        // The control: without the flag, b is held at the contract's home.
+        let mut c = build("");
+        into_quad(&mut c);
+        assert!((c.command().pos[1] - 0.1).abs() < 1e-5, "home, not the stream: {}", c.command().pos[1]);
+    }
+
+    /// A holding state freezes the target it was entered with and drives to
+    /// it at its gains for as long as it is active, whatever the robot
+    /// measures meanwhile -- a robot hanging from a bar must not follow its
+    /// own sag. The control group is `safe`, which holds the measured pose
+    /// with no position gain at all.
+    #[test]
+    fn a_holding_state_freezes_the_target_it_entered_with() {
+        let mut c = executor();
+        let q = [0.1f32, 0.1];
+        ask(&mut c, Some("track"), q, 0);
+        c.set_joint_targets(&[0.6, -0.4]).unwrap();
+        for tick in 1..=2_000u64 {
+            ask(&mut c, Some("track"), q, tick * 1_000);
+        }
+        let reached = c.command().pos.clone();
+        assert!((reached[0] - 0.6).abs() < 1e-5 && (reached[1] + 0.4).abs() < 1e-5, "{reached:?}");
+
+        // Into the hold; the robot sags to somewhere else and the host keeps
+        // streaming -- neither moves the frozen target.
+        for tick in 2_001..=2_100u64 {
+            ask(&mut c, Some("hang"), [0.0, 0.0], tick * 1_000);
+            c.set_joint_targets(&[-1.0, 1.0]).unwrap();
+        }
+        assert_eq!(c.state().name, "hang");
+        assert_eq!(c.command().pos, reached, "the frozen target, not the sag or the stream");
+        assert_eq!((c.command().kp[0], c.command().kd[0]), (9.0, 0.4));
+
+        // Back into tracking: the stream the hold ignored is where it heads now.
+        for tick in 2_101..=5_000u64 {
+            ask(&mut c, Some("track"), [0.0, 0.0], tick * 1_000);
+        }
+        let p = c.command().pos.clone();
+        assert!((p[0] + 1.0).abs() < 1e-5 && (p[1] - 1.0).abs() < 1e-5, "{p:?}");
+
+        // The control: `safe` on stale feedback holds the measured pose with kp 0.
+        let s = at([0.3, 0.3]);
+        let cmd = Command::default();
+        c.tick(&TickInput { state_fresh: false, ..input(&s, &cmd) }, 6_000_000).unwrap();
+        assert_eq!(c.state().name, "safe");
+        // Within a float ulp: the output filter steps from the frozen target
+        // to the measured pose in one `alpha = 1` move.
+        assert!(c.command().pos.iter().all(|p| (p - 0.3).abs() < 1e-6), "{:?}", c.command().pos);
+        assert_eq!(c.command().kp[0], 0.0);
+    }
+
+    /// A tilted robot cannot be launched into a tilt-exempt state by a
+    /// request, and once in one the hand-offs between exempt states are not
+    /// checked: a mount script ending at 93 degrees of pitch hands over to
+    /// the pull-up policy without passing through `safe`. From a policy that
+    /// is not exempt the same tilt is a fall, which is the control.
+    #[test]
+    fn exempt_states_hand_over_while_tilted_and_cannot_be_entered_so() {
+        let tilted = {
+            let mut s = at([0.1, 0.1]);
+            // 90 degrees of pitch: the body's up along the world's x.
+            let h = std::f32::consts::FRAC_1_SQRT_2;
+            s.imu.quat = [h, 0.0, h, 0.0];
+            s
+        };
+        let cmd = Command::default();
+        let tick = |c: &mut Controller, request: Option<&str>, s: &RobotState, now: Micros| {
+            let i = TickInput { request, ..input(s, &cmd) };
+            c.tick(&i, now).unwrap();
+            c.state().name.clone()
+        };
+
+        let mut c = executor();
+        assert_eq!(tick(&mut c, Some("track"), &tilted, 0), "safe", "cannot launch tilted");
+
+        let mut c = executor();
+        let level = at([0.1, 0.1]);
+        assert_eq!(tick(&mut c, Some("track"), &level, 0), "track");
+        assert_eq!(tick(&mut c, Some("track"), &tilted, 1_000), "track", "the tilt is the mount's own");
+        assert_eq!(tick(&mut c, Some("pull_up"), &tilted, 2_000), "pull_up", "handed over, no safe between");
+        assert_eq!(tick(&mut c, Some("hang"), &tilted, 3_000), "hang");
+        // Nothing requested from an exempt state is the default for the one
+        // tick that enters it -- the exempt state was the one armed against
+        // -- and the walk, which is not exempt, is a fall on the next.
+        assert_eq!(tick(&mut c, None, &tilted, 4_000), "locomotion");
+        assert_eq!(tick(&mut c, None, &tilted, 5_000), "safe", "the walk is not exempt, and this is a fall");
     }
 }
 

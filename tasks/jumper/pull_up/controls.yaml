@@ -1,0 +1,85 @@
+# jumper.pull_up operator controls -- how a person's input becomes the command the
+# policy observes.
+#
+# One command, `pull`: how far above the straight-arm hang to hold the body. As
+# asked for on 2026-10-03:
+#
+#     does                         pad                     keyboard
+#     pull up                      right trigger (RT)      up arrow, held
+#       -- squeezed further is higher and all the way is the top of the trained
+#          range; let go, it is the bottom. The up arrow climbs to the top over
+#          `full_after_s` and is back at the bottom the moment it comes up.
+#     let go of everything         B                       Esc
+#     (hands off)                  hang at the bottom, arms straight
+#
+# Started from what `.claude/skills/controls/scripts/write_controls.py` writes and
+# edited by hand: the script writes the velocity command, and this task has none.
+# Every control name below is still checked against `controller/vocabulary.json` on
+# load (`python -m controller --vocabulary` prints the list), so a typo stops
+# `play` rather than binding nothing.
+#
+# Two rules this file inherits from the specification it replaced:
+#   * Every value carries its source. A number without one cannot be told
+#     apart from a guess.
+#   * A consumer fails on a missing or malformed value rather than
+#     substituting a default. A sign that defaults to +1 is a robot that walks
+#     backwards while the screen looks perfectly normal.
+
+schema_version: 2
+
+command:
+  - term: pull
+    # The observation term these numbers are written into.
+    feeds: pull_command
+    # The rise of the base above where it hangs with straight arms, as
+    # `mdp/state.py::rise` measures it.
+    frame: above the straight-arm hang
+    axes:
+      - name: pull
+        unit: m
+        positive: up
+    scaling:
+      # Full deflection is the top of the range the policy was **trained** on, so
+      # a trigger squeezed all the way asks for the highest pull it was ever asked
+      # for and nothing beyond. The range's bottom is 0, which is also where the
+      # axis rests, so a trigger -- 0 when let go -- covers all of it.
+      rule: full_deflection_is_range_edge
+      formula: axis * (range_max if axis >= 0 else -range_min)
+      ends_scaled_separately: true
+
+devices:
+  gamepad:
+    # The trigger's position *is* the command.
+    scheme: absolute
+    layout: xbox
+    axes:
+      # RT reports 0 let go and 1 squeezed all the way, never negative (the
+      # dictionary: "Unipolar: a trigger never reports negative"), and squeezed is
+      # up: +1. A trigger rather than a stick because the command has one end it
+      # rests at, and a trigger has one end it springs back to.
+      pull: { source: RT, sign: 1 }
+    # The service applies its deadband and **rescales**, so a trigger squeezed all
+    # the way still reaches 1. A consumer that applies its own on top narrows the
+    # range a person can ask for and cannot tell that it has.
+    deadzone: device_reported_rescaled
+    # Hands the command back to the random sampler in `play --task`; on a robot,
+    # which has no sampler, it lets go of everything.
+    release_button: B
+
+  keyboard:
+    # Keystrokes bound to what they do, "+" being the axis's own positive
+    # direction as `positive:` words it.
+    scheme: keys
+    # Seconds the up arrow is held for the top: the pull climbs linearly until
+    # then and is back at the bottom the moment the key comes up, as the trigger
+    # let go is. The value every jumper keyboard uses (asked for on 2026-09-26).
+    full_after_s: 2.0
+    axes:
+      # Up pulls up. Down is bound because every axis names keys both ways; with
+      # the range's bottom at the rest it can only hold the pull at the bottom,
+      # which letting go of up already does. Of the arrows the dictionary's key
+      # note names only left and right as doing anything in MuJoCo's viewer
+      # (they step a paused scene).
+      pull: { "+": [key_up], "-": [key_down] }
+    # Lets go of everything, as the pad's B does.
+    release: [key_escape]

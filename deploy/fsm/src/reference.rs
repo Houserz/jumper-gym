@@ -267,6 +267,7 @@ impl Reference {
                 state_fresh: true,
                 command_fresh: true,
                 buttons: &Default::default(),
+                request: None,
                 gripper_active: false,
                 // A recording carries no operator, so nothing squeezes.
                 controls: &Default::default(),

@@ -1188,6 +1188,7 @@ MJRL_SCENE=beach python scripts/train.py         # or from .env
 | `beach` | watching | low warm sun over damp sand, dusk sky, long shadows |
 | `football` | watching | a pitch at one fifth scale: mown turf, markings, goals, afternoon sun, **and a ball the robot can kick** |
 | `swing` | watching | **adds a swing**: an A-frame and a plank seat the robot can stand on. Not what `jumper.swing` trains against — that task builds its own, and `--scene swing` on top of it raises rather than rigging two |
+| `bar` | watching | **adds a pull-up bar**: 0.27 m above a 0.22 m platform, 0.11 m past its edge. Not what `jumper.pull_up` trains against — that task builds its own, and `--scene bar` on top of it raises rather than rigging two |
 | `ice` | both | **changes the ground**: wet ice, sliding friction 0.03 against the feet's 1.2 |
 | `rubber` | both | **changes the ground**: a coarse anti-slip mat at 1.8 -- the other end of `ice` |
 | `soft` | training | **changes the ground**: `default`'s look, but the feet sink into it |

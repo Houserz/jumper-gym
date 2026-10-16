@@ -352,6 +352,9 @@ impl WebFsm {
             state_fresh,
             command_fresh,
             buttons: self.latch.active(),
+            // A page drives modes through its switches; it has no request
+            // path, so a `request:` rule never fires here.
+            request: None,
             gripper_active: false,
             controls: &crate::types::TaskControls::NONE,
         };

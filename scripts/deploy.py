@@ -603,6 +603,32 @@ def manifest_modes(spec: dict, path: Path) -> tuple[dict[str, Path], dict[str, d
                 f"           tasks/{task.replace('.', '/')}/deploy/lib.rs says what it "
                 f"takes."
             )
+        # A mode whose motion legitimately passes the cascade's tilt limit --
+        # hanging from a bar is 93 degrees of pitch -- says so here, and the
+        # flag lands on its state. Only a bool: a value that is not one would
+        # otherwise be written as `true` or dropped, and a mode that drops to
+        # `safe` the moment it hangs looks like a policy that fell.
+        skip_tilt = entry.get("skip_tilt_check", False)
+        if not isinstance(skip_tilt, bool):
+            raise SystemExit(
+                f"[deploy] {path}: mode {mode!r}'s `skip_tilt_check` is {skip_tilt!r}; "
+                f"it is true or false"
+            )
+
+        # A mode whose policy leaves joints to the host -- `jumper.quad_walk`'s
+        # arms, which the crab gym's inverse kinematics moves while the policy
+        # walks -- names the fastest those streamed targets may move, rad/s,
+        # and its state streams them (`StateConfig::stream_undriven`). A number
+        # rather than a flag: a stream with no rate limit reaches the servos
+        # as steps, and the controller refuses one.
+        stream = entry.get("stream_undriven")
+        if stream is not None and (isinstance(stream, bool) or not isinstance(stream, (int, float))
+                                   or not stream > 0):
+            raise SystemExit(
+                f"[deploy] {path}: mode {mode!r}'s `stream_undriven` is {stream!r}; it is the "
+                f"fastest a streamed target of a joint the policy does not drive may move, "
+                f"rad/s, a number above zero"
+            )
 
         modes[mode] = where
         detail[mode] = {"task": task, "from": ckpt or "(the export records no checkpoint)",
@@ -613,6 +639,8 @@ def manifest_modes(spec: dict, path: Path) -> tuple[dict[str, Path], dict[str, d
                         # only from the cascade -- fine for one mode, and an
                         # unreachable state for any of the others.
                         **({"hook": hook} if hook is not None else {}),
+                        **({"skip_tilt_check": True} if skip_tilt else {}),
+                        **({"stream_undriven": float(stream)} if stream is not None else {}),
                         **switches}
     if not modes:
         raise SystemExit(f"[deploy] {path}: this bundle has no modes")
@@ -715,6 +743,9 @@ def compose_fsm(spec: dict, detail: dict[str, dict], models: dict[str, str],
         f'task = "{detail[mode]["task"]}"\n'
         + (f'hook = {_toml_value(detail[mode]["hook"], f"{mode}.hook")}\n'
            if "hook" in detail[mode] else "")
+        + ("skip_tilt_check = true\n" if detail[mode].get("skip_tilt_check") else "")
+        + (f'stream_undriven = true\nrate_limit = {detail[mode]["stream_undriven"]}\n'
+           if "stream_undriven" in detail[mode] else "")
         for mode in sorted(detail)
     )
     # Each device's switch into a mode is a binding of its own, named after the

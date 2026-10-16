@@ -133,7 +133,13 @@ pub struct Layout {
     pub obs_joint_order: Vec<String>,
     /// Joints the action controls, in the order of the action vector.
     pub action_joint_order: Vec<String>,
-    pub action_scale: f32,
+    /// One number for every driven joint, or `{joint: number}` when they
+    /// differ -- `scripts/export.py` writes the map for a task whose action
+    /// term scales joints apart (`jumper.pull_up`: 0.05 on the grip-held
+    /// shoulders, 0.75 on the elbows, 0.5 on the legs). Resolved into
+    /// `Contract::action_scale`, one per action element; every host reads
+    /// that.
+    pub action_scale: ActionScale,
     pub default_joint_pos: HashMap<String, f32>,
     /// `[lo, hi]` per joint, in the same radians as the home pose.
     ///
@@ -168,6 +174,15 @@ pub struct Layout {
     pub reference: Option<crate::trajectory::ReferenceSpec>,
 }
 
+/// `action_scale` as the exporter writes it: a number, or a map by joint name
+/// when the joints differ.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ActionScale {
+    Uniform(f32),
+    PerJoint(HashMap<String, f32>),
+}
+
 /// The contract resolved against one robot's wire order.
 #[derive(Debug)]
 pub struct Contract {
@@ -176,6 +191,9 @@ pub struct Contract {
     pub obs_wire_idx: Vec<usize>,
     /// `action_wire_idx[i]` = wire index driven by action element `i`.
     pub action_wire_idx: Vec<usize>,
+    /// `action_scale[i]` = the scale on action element `i`, from the
+    /// layout's number or its map.
+    pub action_scale: Vec<f32>,
     /// Home pose in **wire** order, covering every joint the robot has.
     pub default_wire: Vec<f32>,
     /// The robot's joint names in **wire** order: the order every `*_wire`
@@ -337,6 +355,29 @@ impl Contract {
                 layout.action_joint_order.len()
             )));
         }
+        // One scale per action element. A map has to name every driven
+        // joint: a joint it leaves out would be decoded at a scale somebody
+        // guessed, which is a policy driving that joint by the wrong amount
+        // with nothing raised.
+        let action_scale: Vec<f32> = match &layout.action_scale {
+            ActionScale::Uniform(s) => vec![*s; layout.action_joint_order.len()],
+            ActionScale::PerJoint(map) => {
+                let mut out = Vec::with_capacity(layout.action_joint_order.len());
+                for name in &layout.action_joint_order {
+                    let s = map.get(name).ok_or_else(|| {
+                        Error::Inconsistent(format!(
+                            "action_scale is a map and names no scale for {name}, which the \
+                             action drives"
+                        ))
+                    })?;
+                    out.push(*s);
+                }
+                out
+            }
+        };
+        if let Some(s) = action_scale.iter().find(|s| !s.is_finite()) {
+            return Err(Error::Inconsistent(format!("action_scale carries {s}, which is not a number")));
+        }
 
         // Isaac's term names -> the observation builder's own. The two agree on
         // everything but the command block, which each task names for what it
@@ -381,6 +422,7 @@ impl Contract {
             layout,
             obs_wire_idx,
             action_wire_idx,
+            action_scale,
             default_wire,
             joint_names: joint_names.to_vec(),
             joint_limits,
@@ -509,6 +551,28 @@ mod tests {
                                   {"name": "joint_vel", "dim": 2}]},
         "action": {"dim": 2}
     }"#;
+
+    /// `action_scale` is a number for every joint or a map by name -- what
+    /// `scripts/export.py` writes for `jumper.pull_up`, whose grip-held
+    /// shoulders are scaled 0.05 against 0.75 on the elbows -- and the map
+    /// has to name every driven joint: one left out would be decoded at a
+    /// scale somebody guessed. The uniform number is the control group, and
+    /// the map's scales land on the action elements in action order, not in
+    /// the map's.
+    #[test]
+    fn an_action_scale_map_scales_each_joint_its_own_way() {
+        let c = Contract::from_str(MINIMAL, &joints()).unwrap();
+        assert_eq!(c.action_scale, [0.25, 0.25]);
+
+        let map = MINIMAL.replace("\"action_scale\": 0.25", "\"action_scale\": {\"b\": 0.05, \"a\": 0.5}");
+        assert_ne!(map, MINIMAL);
+        let c = Contract::from_str(&map, &joints()).unwrap();
+        assert_eq!(c.action_scale, [0.5, 0.05], "in action order, a then b");
+
+        let short = MINIMAL.replace("\"action_scale\": 0.25", "\"action_scale\": {\"a\": 0.5}");
+        let e = Contract::from_str(&short, &joints()).unwrap_err();
+        assert!(e.to_string().contains("names no scale for b"), "{e}");
+    }
 
     #[test]
     fn resolves_joints_by_name_not_position() {

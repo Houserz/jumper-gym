@@ -148,6 +148,7 @@ impl SourceCapability {
             ("commands_diff", Provenance::Measured),
             // The operator's, off the pad, like `commands`.
             ("posture_command", Provenance::Measured),
+            ("pull_command", Provenance::Measured),
             ("gait_phase", Provenance::Reconstructed),
             ("jump_phase", Provenance::Reconstructed),
             ("ref_future", Provenance::Reconstructed),

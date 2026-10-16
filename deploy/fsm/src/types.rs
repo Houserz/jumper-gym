@@ -171,6 +171,10 @@ pub struct Command {
     pub base_pitch: f32,
     pub base_roll: f32,
     pub base_twist: f32,
+    /// `jumper.pull_up`'s command: how far above the straight-arm hang to
+    /// pull, in metres. Read by the `pull_command` observation term and by
+    /// nothing else; zero -- hang still -- for every other policy.
+    pub pull: f32,
     /// The operator's action pulse: non-zero for a few frames on a button press.
     /// A **rising edge** is one request, which is why the loop tracks the previous
     /// value rather than acting while it is high -- the pulse repeats for three
@@ -188,8 +192,8 @@ impl Command {
     ///
     /// The names are the command terms' own axes -- `ang_vel_z`, not the
     /// builder's `yaw_rate`, and `twist` / `pitch` / `roll` / `height` for
-    /// `jumper.posture` -- plus `yaw_rate`, which is what `command_terms` has
-    /// always called the third velocity channel.
+    /// `jumper.posture`, `pull` for `jumper.pull_up` -- plus `yaw_rate`, which
+    /// is what `command_terms` has always called the third velocity channel.
     pub fn set_axis(&mut self, name: &str, value: f32) -> bool {
         match name {
             "lin_vel_x" => self.lin_vel_x = value,
@@ -199,6 +203,7 @@ impl Command {
             "pitch" => self.base_pitch = value,
             "roll" => self.base_roll = value,
             "height" => self.height = value,
+            "pull" => self.pull = value,
             _ => return false,
         }
         true
@@ -214,6 +219,7 @@ impl Command {
             "pitch" => self.base_pitch,
             "roll" => self.base_roll,
             "height" => self.height,
+            "pull" => self.pull,
             _ => return None,
         })
     }

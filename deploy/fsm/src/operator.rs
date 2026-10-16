@@ -1685,37 +1685,25 @@ impl Operators {
             .join(" | ")
     }
 
-    /// Where a command the host builds itself rests, for every mode at once.
+    /// Where a command the host builds itself rests while `mode` runs: each
+    /// channel at that mode's own rest -- the standing height for a posture
+    /// policy, zero for the rest -- and every channel the mode does not read at
+    /// zero. A mode with no controls rests everything at zero.
     ///
-    /// `play` hands the controller one finished command whatever mode is
-    /// running (`py.rs`), so a channel it does not name has to rest where every
-    /// mode reading that channel rests it -- the standing height for a posture
-    /// policy, zero for the rest. Two modes resting one channel at different
-    /// values have no such command between them, and that is refused by name
-    /// rather than settled by whichever mode sorts first.
-    pub fn shared_rest(&self) -> Result<Command, String> {
+    /// Per mode, not one rest for every mode: two posture-family policies
+    /// stand at different neutral heights (`jumper.posture` at 0.10647 m,
+    /// `jumper.quad_walk` at 0.12), and one bundle holds both. A single rest
+    /// would be wrong for one of them, and refusing the pair -- which this was
+    /// until 2026-10-09 -- refused a bundle the robot itself loads, where each
+    /// mode reads the pad through its own operator and its own rest.
+    pub fn rest_of(&self, mode: &str) -> Command {
         let mut rest = Command::default();
-        let mut owner: BTreeMap<&str, (&str, f32)> = BTreeMap::new();
-        for (mode, o) in self.iter() {
+        if let Some(o) = self.by_mode.get(mode) {
             for a in &o.axes {
-                match owner.get(a.name.as_str()) {
-                    Some((other, at)) if (at - a.rest).abs() > 1e-6 => {
-                        return Err(format!(
-                            "modes '{other}' and '{mode}' rest '{}' at {at} and {}. A command \
-                             the host builds itself is handed to both, and cannot be at rest \
-                             for both.",
-                            a.name, a.rest
-                        ))
-                    }
-                    Some(_) => {}
-                    None => {
-                        owner.insert(a.name.as_str(), (mode, a.rest));
-                        rest.set_axis(&a.name, a.rest);
-                    }
-                }
+                rest.set_axis(&a.name, a.rest);
             }
         }
-        Ok(rest)
+        rest
     }
 }
 
@@ -2606,32 +2594,21 @@ pub(crate) mod tests {
         assert!(!line.contains('\n'), "a page shows this as one line: {line}");
     }
 
-    /// A command the host builds itself rests every channel where the modes
-    /// reading it do: the standing height for the posture mode, and nothing
-    /// else moved by the claw mode, which has no height. Two modes resting one
-    /// channel apart have no such command, and are named -- the control group
-    /// for the refusal is the same two blocks resting together.
+    /// A command the host builds itself rests every channel where the mode
+    /// running rests it: the standing height for the posture mode, and nothing
+    /// moved by the claw mode, which has no height. Two modes resting one
+    /// channel apart each keep their own -- the case a single shared rest
+    /// could not hold -- and a mode with no controls rests at zero.
     #[test]
-    fn a_host_built_command_rests_where_every_mode_rests() {
+    fn a_host_built_command_rests_where_the_running_mode_rests() {
         let (walk, claw) = (contract_with(BLOCK), contract_ranged(CLAW_BLOCK, CLAW_RANGES));
-        let rest = Operators::of([("walk", &walk), ("claw", &claw)].into_iter())
-            .unwrap()
-            .shared_rest()
-            .unwrap();
-        assert!((rest.height - 0.107).abs() < EPS);
-        assert_eq!(rest.lin_vel_x, 0.0);
-
         let taller = contract_with(&BLOCK.replace(r#""rest": 0.107"#, r#""rest": 0.12"#));
-        let e = Operators::of([("walk", &walk), ("tall", &taller)].into_iter())
-            .unwrap()
-            .shared_rest()
-            .unwrap_err();
-        assert!(e.contains("'tall'") && e.contains("'walk'") && e.contains("'height'"), "{e}");
-        let again = contract_with(BLOCK);
-        assert!(Operators::of([("walk", &walk), ("again", &again)].into_iter())
-            .unwrap()
-            .shared_rest()
-            .is_ok());
+        let ops = Operators::of([("walk", &walk), ("claw", &claw), ("tall", &taller)].into_iter()).unwrap();
+        assert!((ops.rest_of("walk").height - 0.107).abs() < EPS);
+        assert!((ops.rest_of("tall").height - 0.12).abs() < EPS);
+        assert_eq!(ops.rest_of("claw").height, 0.0);
+        assert_eq!(ops.rest_of("walk").lin_vel_x, 0.0);
+        assert_eq!(ops.rest_of("no such mode").height, 0.0);
     }
 
     /// The newest export of a task this repository actually produced whose

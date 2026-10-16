@@ -325,6 +325,9 @@ impl DeviceHost {
             state_fresh,
             command_fresh,
             buttons: self.latch.active(),
+            // The robot has no host asking for states by name: its modes are
+            // the pad's, so a `request:` rule never fires on the board.
+            request: None,
             gripper_active: false,
             controls: &crate::types::TaskControls::default(),
         };

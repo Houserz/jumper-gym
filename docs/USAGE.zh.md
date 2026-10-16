@@ -1,4 +1,4 @@
-<!-- tracks: USAGE.md @ sha256:e34e5853b9ba4dfd -->
+<!-- tracks: USAGE.md @ sha256:cd7d24a60fec53d2 -->
 
 # 手册
 
@@ -1028,6 +1028,7 @@ MJRL_SCENE=beach python scripts/train.py         # 或者写在 .env 里
 | `beach` | watching | 湿沙上的低角度暖阳，黄昏的天空，长长的影子 |
 | `football` | watching | 五分之一尺度的球场：修剪过的草皮、线标、球门、午后的阳光，**以及一个机器人能踢的球** |
 | `swing` | watching | **加了一个秋千**：一个 A 字架和一块机器人能站上去的板子座。这不是 `jumper.swing` 训练用的那个 —— 那个任务自己搭一个，在它之上再加 `--scene swing` 会直接报错，而不是搭出两个 |
+| `bar` | watching | **加了一根单杠**：在 0.22 m 高的平台边缘外 0.11 m、台面上方 0.27 m。这不是 `jumper.pull_up` 训练用的那根 —— 那个任务自己搭一套，在它之上再加 `--scene bar` 会直接报错，而不是搭出两套 |
 | `ice` | both | **改的是地面**：湿冰，滑动摩擦 0.03，对上脚的 1.2 |
 | `rubber` | both | **改的是地面**：粗糙的防滑垫，1.8 —— `ice` 的另一端 |
 | `soft` | training | **改的是地面**：`default` 的外观，但脚会陷进去 |
