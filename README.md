@@ -52,6 +52,7 @@ This repo is Jumper’s AI toolkit for appearance, motion, and scene creation. O
 | [Colab training](docs/COLAB.md) | GPU training in a notebook, checkpoint backup, resume, ONNX export and MP4 simulation replay. |
 | [Motion bundles](deploy/BUNDLE.md) | Package trained motions and their controller as an `.app`; see the [build guide](deploy/README.md) for prerequisites. |
 | [Project guide](docs/PROJECT_GUIDE.md) | Setup, current capabilities and further documentation. |
+| [The crab gym](docs/CRABGYM.md) | Gemini Robotics-ER 2 directs the robot through pull-ups in simulation, on the robot's own camera and depth sensor: `python -m crabgym "做 3 个引体向上" --agent gemini`. |
 
 Training builds on [mjlab](https://github.com/mujocolab/mjlab),
 [rsl_rl](https://github.com/leggedrobotics/rsl_rl), [MuJoCo](https://github.com/google-deepmind/mujoco)

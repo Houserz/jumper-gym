@@ -49,3 +49,16 @@ deploy/fsm/vendor/rknpu2/
     Filled by fetch.sh with Rockchip's rknn_api.h and librknnrt.so, which are
     under Rockchip's RKNN SDK License and are not covered by this repository's
     licence. See deploy/fsm/vendor/rknpu2/README.md.
+
+Modifications in this fork (Houserz/jumper-gym), by Houserz, 2026
+
+    Added: crabgym/ -- the crab gym, Gemini Robotics-ER 2 directing the
+    robot through pull-ups in simulation, with its station's map in
+    crabgym/maps/ and its bundle in out/bundle_gym/ -- the tasks
+    tasks/jumper/quad_walk/ and tasks/jumper/pull_up/, scenes/bar.py,
+    deploy/gym.controller.toml, and the tests for them.
+    Changed: the controller under deploy/fsm/ (a mode's undriven joints
+    streamed from the host), rl/mjrl/app_play.py, scenes/, scripts/deploy.py,
+    scripts/export.py, deploy/manifests.json, and the documents that point to
+    the crab gym. The git history says what changed, file by file. All of it
+    is under the Apache License, Version 2.0, as the rest of the Work is.

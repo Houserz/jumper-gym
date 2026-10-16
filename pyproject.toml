@@ -56,6 +56,10 @@ dependencies = [
     # `play --app` reads the app's controller.toml, and `tomllib` arrived in
     # Python 3.11; this is the same parser under its original name, for 3.10.
     "tomli>=1.1; python_version < '3.11'",
+    # ── The crab gym ──
+    # ER is Gemini Robotics-ER 2, through Google's SDK (`crabgym/agent/loop.py`);
+    # the version the runs in docs/CRABGYM.md were made with.
+    "google-genai>=2.28",
 ]
 
 [project.urls]
@@ -81,7 +85,7 @@ build-backend = "setuptools.build_meta"
 # relied on the repository root being on sys.path by default).
 [tool.setuptools.packages.find]
 where = [".", "rl"]
-include = ["tasks*", "scenes*", "controller*", "mjrl*", "mjlab*", "rsl_rl*"]
+include = ["tasks*", "scenes*", "controller*", "crabgym*", "mjrl*", "mjlab*", "rsl_rl*"]
 
 # Scene images live inside the `scenes` package, beside the code that describes
 # them. setuptools collects only .py by default, so a built wheel would have the
@@ -97,6 +101,9 @@ tasks = ["jumper/jump/ref/*.npz"]
 # and at compile time by `deploy/fsm`. Same reason as the scene textures: a
 # wheel with the module and not the file fails on first use, not on build.
 controller = ["vocabulary.json"]
+# The console's page (`python -m crabgym.web`) is served from beside its code:
+# without this a wheel has the server and no page.
+crabgym = ["web/static/*"]
 
 [tool.ruff]
 line-length = 100

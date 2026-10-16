@@ -31,6 +31,7 @@ Delegate independent tasks and preserve required validation regardless of model 
 | Change controls | [`docs/CONTROLS.md`](docs/CONTROLS.md), then the `controls` skill |
 | Export or deploy a policy | [`deploy/README.md`](deploy/README.md), then the `deploy` skill |
 | Read or write a bundle consumer | [`deploy/BUNDLE.md`](deploy/BUNDLE.md) |
+| Run Gemini Robotics-ER 2 in the simulated pull-up gym | [`docs/CRABGYM.md`](docs/CRABGYM.md) |
 | Navigate the repository or run checks | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
 
 ## Skills

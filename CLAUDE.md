@@ -10,8 +10,8 @@ shaped this way, [`docs/USAGE.md`](docs/USAGE.md) for tasks / assets / defaults,
 [`docs/CONTROLS.md`](docs/CONTROLS.md) for the pad, the keyboard and the mode switches,
 [`docs/VENDOR.md`](docs/VENDOR.md) for the vendored copies, [`docs/AGENT_SETUP.md`](docs/AGENT_SETUP.md)
 for bringing a machine up, [`deploy/README.md`](deploy/README.md) for getting a policy onto the robot,
-and [`deploy/BUNDLE.md`](deploy/BUNDLE.md) for the bundle a host loads. What follows is what those
-documents assume you already know.
+[`deploy/BUNDLE.md`](deploy/BUNDLE.md) for the bundle a host loads, and [`docs/CRABGYM.md`](docs/CRABGYM.md)
+for the simulated gym Gemini Robotics-ER 2 runs the robot in. What follows is what those documents assume you already know.
 
 ## Commands
 

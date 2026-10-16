@@ -70,6 +70,15 @@
     "The `controls` skill covers all of this, and is where to start."
   ],
 
+  "_tilt": [
+    "A mode may carry `skip_tilt_check: true`, which lands on its [[fsm.state]]: the",
+    "cascade's `tilted` rule is suspended while that mode is active. For a motion",
+    "that legitimately passes `tilt_limit` -- jumper.pull_up hangs pitched 93",
+    "degrees -- and for nothing else: a diverging policy in such a mode will not",
+    "drop to safe on its own. The tick that enters the mode is still checked.",
+    "The cascade file may not set it on the safe state."
+  ],
+
   "_hooks": [
     "A mode may carry `hook`, its task's deploy configuration, a JSON object the",
     "bundler copies into the mode's [[fsm.state]] beside its task id. On the robot",
@@ -236,6 +245,45 @@
           "_reached_by": "Right on the d-pad; 4. From locomotion only (Control-agent 3.1: 行走模式下); in a claw mode the d-pad is the arm's, and Shift, Alt and Ctrl too.",
           "pad": {"button": "dpad_right", "on": "toggle", "from": ["locomotion"]},
           "keys": {"key": ["key_4", "keypad_4"], "on": "toggle", "from": ["locomotion"]}
+        }
+      }
+    },
+
+    "gym": {
+      "description": "The crab gym's bundle, for `crabgym` (python -m crabgym): jumper.posture walking by default, jumper.quad_walk walking on four legs to the bar with the arms raised for the executor's inverse kinematics, and jumper.pull_up hanging from the bar, with the executor's two states -- the scripted mount and dismount (`track`) and holding on (`hang`) -- in gym.controller.toml. No pad switches: the executor asks for each mode by name through the controller's request path, and a person driving `play --app` with this bundle walks it and nothing more. Built with `python scripts/deploy.py --manifest gym --allow-incomplete`: it runs in the simulator only, so it needs neither the board's cross build nor the .rknn conversions.",
+      "fsm": "gym.controller.toml",
+
+      "modes": {
+        "locomotion": {
+          "task": "jumper.posture",
+          "_note": "The jumper bundle's walk, from the same export: the executor sends it the twist and the posture through set_command_axes, in the units its controls.yaml names.",
+          "policy": "tasks/jumper/posture/out/example",
+          "_reached_by": "The cascade's `always` rule, when the executor asks for nothing."
+        },
+
+        "pull_up": {
+          "task": "jumper.pull_up",
+          "_note": "Pull-ups from the hang, model_9998 of a run trained on the station's rig, the bar 0.27 m over the deck and 0.11 m past it (2026-10-09, tasks/jumper/pull_up/README.md). Not that run's last accepted model_11997: handed the robot by the gym's swing, that one throws its legs over its back and does not pull, and model_9998 does. The executor streams the pull command -- the rise above the hang, metres -- through set_command_axes, as the trigger would. `skip_tilt_check`: hanging is 93 degrees of pitch, past the cascade's 50. The hook squeezes both fingers 0.08 rad past the contact angle, about 0.5 N*m, so the claws hold the bar by contact (the contact-grip probe of 2026-10-05: without it 111 of 256 pushed-about environments fell, with it none).",
+          "policy": "tasks/jumper/pull_up/out/gym",
+          "skip_tilt_check": true,
+          "hook": { "squeeze": 0.08 },
+          "_reached_by": "The executor's request, from `track` at the top of the swing off the deck (crabgym's swing_under), the pull command then run down to the hang. No switch: entering it on the platform would be a hang policy with nothing to hang from."
+        },
+
+        "quad_walk": {
+          "task": "jumper.quad_walk",
+          "_note": "Four legs, nose up, the arms raised: the walk to the deck's edge and the stance the claws reach from, model_4498 (run 2026-10-08_19-44-35, the best of the training rounds). The policy drives LM/RM/LR/RR only; the arms are the executor's, streamed through set_joint_targets while the policy walks (`stream_undriven`, 2.5 rad/s as `track`'s), as its training's environment moved them. The executor sends the twist and the posture -- pitch nose up, height -- through set_command_axes.",
+          "policy": "tasks/jumper/quad_walk/out/example",
+          "stream_undriven": 2.5,
+          "_reached_by": "The executor's request (crabgym's quad_on), from the six-leg walk at the quad start, 0.45 m back from the bar. No switch: a person driving play --app with this bundle walks on six legs."
+        },
+
+        "gesture_hello": {
+          "task": "jumper.gesture_hello",
+          "_note": "The jumper bundle's wave, for the executor's `wave` skill (the plan's M2 exit: find the bar, walk to it, wave). A recording that ends by itself and hands back.",
+          "policy": "tasks/jumper/gesture_hello/out/example",
+          "_reached_by": "1 on the keyboard, from locomotion -- which is also how the executor asks for it, pressing the key through the controller's own path.",
+          "keys": {"key": ["key_1", "keypad_1"], "on": "toggle", "from": ["locomotion"]}
         }
       }
     }

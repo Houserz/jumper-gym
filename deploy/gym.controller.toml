@@ -1,0 +1,136 @@
+# The crab gym's state machine, minus the modes.
+#
+# `manifests.json`'s `gym` bundle owns the two modes that run a policy --
+# `locomotion` (jumper.posture) and `pull_up` -- and this file owns everything
+# else: the cascade, the safety limits, and the two states that run no model
+# and that an executor drives the robot through between those policies. Nobody
+# holds a pad here: `crabgym` sequences the modes itself through the
+# controller's `request_mode`, which the `request:` rules below read, and
+# streams the joint targets of the scripted mount and dismount through
+# `set_joint_targets`, which the `track` state follows.
+#
+# The cascade is **ordered** and the first rule that matches wins, as in
+# `jumper.controller.toml`: feedback before attitude before anything the
+# executor asks for, so a request cannot launch a blind or a tilted robot.
+
+[fsm]
+initial_state = "locomotion"
+warm_start_ref = "locomotion"
+safe_state = "safe"
+exclusive = true
+
+# Radians of tilt before the cascade drops to `safe`: jumper.controller.toml's
+# 50 degrees, for the same reason. A hanging robot is pitched 93 degrees
+# (`tasks/jumper/pull_up/hang.py`, PITCH), far past it, which is why every
+# state the robot hangs in -- `track`, `hang` and the manifest's `pull_up` --
+# sets `skip_tilt_check`. The tick that *enters* each of them is still
+# checked, so the mount cannot start from a robot already on its side.
+tilt_limit = 0.873
+
+# As the jumper bundle: five control periods of feedback, half a second of
+# silence from the executor before its request and the latches are forgotten.
+# The clock is the simulator's, so a planner thinking for a minute of wall
+# time between two ticks costs no freshness at all.
+state_timeout_ms = 100
+command_timeout_ms = 500
+
+# **No switch-in ramp.** The hand-offs the executor chains -- stance into the
+# mount script, the mount into pull_up, pull_up into the dismount, the
+# dismount into the walk -- each end where the next begins: the scripts start
+# and finish at the poses the policies hold, so a ramp would slide the robot
+# to the pose it is already in, at the ramp's gains, with the fingers' squeeze
+# off for a second while it hangs. With 0 the policy seeds where the robot
+# stands and the first inference is its own. `pose_reach_tol` is read by
+# nothing then, and the warm start never runs; both are required keys.
+mode_switch_ramp_s = 0.0
+pose_reach_tol = 0.10
+warm_start_duration_s = 0.0
+ramp_kp = 15.0
+ramp_kd = 0.8
+
+# Holds whatever pose it was in, with damping only. Where stale feedback and a
+# tilt the active state does not exempt both go. On the platform that is a
+# robot sitting down; on the bar it would be a fall, which is what `hang` is
+# for.
+[[fsm.state]]
+name = "safe"
+hold_current = true
+kd = 0.01
+
+# The mount and dismount: the executor streams joint targets, this state
+# drives to them and no faster than `rate_limit`. The gains are twice the
+# policies' (the pull_up and posture contracts both carry kp 10, kd 0.5): the
+# body servo behind the stream (`crabgym/motion.py`) measures the body and
+# commands the legs past where it wants them by what they sag, and at kp 10
+# the sag under a reared body ran to 12 degrees of pitch, more than it is
+# allowed to command past the measurement.
+#
+# 2.5 rad/s is the fastest any joint moves in the climb, chosen so that a
+# target the executor interpolates reaches the servos as the interpolation
+# and never as a step; a stream that asked for more would be slowed to it,
+# visibly, rather than handed through.
+[[fsm.state]]
+name = "track"
+track_targets = true
+rate_limit = 2.5
+kp = 20.0
+kd = 0.8
+skip_tilt_check = true
+
+# Hanging and holding on: the target published as this state was entered,
+# frozen, at the policies' gains -- fingers squeezed as pull_up's hook left
+# them. Where the executor puts the robot when something on the bar needs
+# stopping (ER's `stop()`, a script refused mid-way), instead of `safe`'s
+# damping-only hold, which would let the bar out of the pocket.
+[[fsm.state]]
+name = "hang"
+hold_pose = true
+kp = 10.0
+kd = 0.5
+skip_tilt_check = true
+
+[[fsm.rule]]
+when = "feedback_stale"
+enter = "safe"
+
+[[fsm.rule]]
+when = "tilted"
+enter = "safe"
+
+# Out of `safe` only once feedback is back and the robot is level: the two
+# rules above are ahead of this one.
+[[fsm.rule]]
+when = "in_state:safe"
+enter = "@initial"
+
+# What the executor asks for, below the safety rules and above the fallback.
+# `hang` first: asked for while something else is running it wins at once.
+[[fsm.rule]]
+when = "request:hang"
+enter = "hang"
+
+[[fsm.rule]]
+when = "request:track"
+enter = "track"
+
+[[fsm.rule]]
+when = "request:pull_up"
+enter = "pull_up"
+
+# The four-leg walk the claws reach from: the executor asks for it at the
+# standoff and keeps asking through the reach and the grip.
+[[fsm.rule]]
+when = "request:quad_walk"
+enter = "quad_walk"
+
+# The wave, a recording that ends by itself: the manifest's `gesture_hello`
+# switch, which the executor presses as a person would.
+[[fsm.rule]]
+when = "button:gesture_hello"
+enter = "gesture_hello"
+
+# Nothing requested is the walk. A mode that ends does not fall back here by
+# itself: the executor names what comes next, and keeps naming it.
+[[fsm.rule]]
+when = "always"
+enter = "locomotion"

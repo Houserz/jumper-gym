@@ -1,4 +1,4 @@
-<!-- tracks: README.md @ sha256:6c35e964fc575f2d -->
+<!-- tracks: README.md @ sha256:f1c2274f72bf67fb -->
 
 ![跳跳](docs/media/jumper-hero-zh.png)
 
@@ -54,6 +54,7 @@
 | [Colab 训练](docs/COLAB.zh.md) | 在 Notebook 中使用 GPU 训练、备份与恢复检查点、导出 ONNX 并录制仿真 MP4。 |
 | [动作包格式](deploy/BUNDLE.md) | 将训练好的动作及控制器打包为 `.app`；环境要求见[构建指南](deploy/README.md)。 |
 | [项目指南](docs/PROJECT_GUIDE.zh.md) | 环境安装、当前能力和更多文档。 |
+| [螃蟹健身房](docs/CRABGYM.md) | Gemini Robotics-ER 2 在仿真里指挥机器人做引体向上，只用机器人自己的相机和深度传感器：`python -m crabgym "做 3 个引体向上" --agent gemini`。 |
 
 训练基于 [mjlab](https://github.com/mujocolab/mjlab)、
 [rsl_rl](https://github.com/leggedrobotics/rsl_rl)、[MuJoCo](https://github.com/google-deepmind/mujoco)

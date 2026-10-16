@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ER console</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <header class="brand">
+      <h1>ER console</h1>
+      <span id="conn" class="conn" title="the console's server"></span>
+    </header>
+    <div class="filters">
+      <input id="search" type="search" placeholder="Search instructions" autocomplete="off">
+      <div id="families" class="chips" role="radiogroup" aria-label="Agent"></div>
+      <label class="follow"><input id="follow" type="checkbox" checked> Follow new runs</label>
+    </div>
+    <ol id="runs" class="runs"></ol>
+  </aside>
+  <main id="main" class="main">
+    <div id="empty" class="empty">
+      <p>Pick a run on the left.</p>
+      <p class="hint">A run started with <code>python -m crabgym "…"</code> appears here as it begins, and is followed live.</p>
+    </div>
+    <section id="run" class="run-view" hidden>
+      <div id="header" class="run-header"></div>
+      <div id="thread" class="thread"></div>
+      <div id="activity" class="activity" hidden></div>
+    </section>
+    <button id="latest" class="latest" type="button" hidden>Jump to latest ↓</button>
+  </main>
+</div>
+<div id="lightbox" class="lightbox" hidden>
+  <figure><img alt=""><figcaption></figcaption></figure>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>
